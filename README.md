@@ -2,6 +2,9 @@
 
 A command-line tool and web dashboard for monitoring a Char Griller Gravity 980 BBQ temperature controller. Connects via Bluetooth Low Energy (BLE) to bootstrap the device onto WiFi, then streams real-time probe temperatures, fan status, door state, and alarm info over TCP.
 
+<img width="968" height="832" alt="Screenshot 2026-05-10 at 5 49 39 AM" src="https://github.com/user-attachments/assets/dc1c127c-8b7f-4061-aa73-31a70db1888b" />
+(Screen shot taken after the end of smoking my latest brisket).
+
 ## Features
 
 - **BLE WiFi provisioning** — discovers the Gravity device, scans for WiFi networks, provisions credentials, and activates the connection. No phone app needed.
