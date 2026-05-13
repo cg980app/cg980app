@@ -26,6 +26,7 @@ Based on [cg980app](https://github.com/cg980app/cg980app).
 
 ## Requirements
 
+- macOS or Linux
 - Python 3.12+
 - `bleak` for BLE
 
