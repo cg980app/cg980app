@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """
-Gravity BBQ Controller — Command Line Monitor & Web Dashboard
+chargrillerd - Char-Griller BBQ Monitor & Web Dashboard
 
-Connects to a Gravity980 BBQ temperature controller via BLE, bootstraps it onto
-WiFi, then monitors live probe/fan/door/alarm status over TCP port 3333. Also
-serves a real-time web dashboard with historical temperature graphs.
+Supports Char-Griller Gravity 980 and Auto Akorn. Connects via BLE to
+bootstrap the device onto WiFi, then monitors live probe/fan/door/alarm
+status over TCP port 3333. Serves a real-time web dashboard.
+
+Based on cg980app (https://github.com/cg980app/cg980app).
 
 Requirements:
     pip install bleak
 
 Usage:
-    python3 gravity_monitor.py                  # BLE connect (default)
-    python3 gravity_monitor.py --wifi           # Find device already on WiFi
-    python3 gravity_monitor.py --ip 192.168.x.x # Direct IP connection
-    python3 gravity_monitor.py --disconnect     # Disconnect device from WiFi
-    python3 gravity_monitor.py --port 9090      # Custom dashboard port
+    python3 chargrillerd.py                  # BLE connect (auto-detect)
+    python3 chargrillerd.py --wifi           # Find device already on WiFi
+    python3 chargrillerd.py --ip 192.168.x.x # Direct IP connection
+    python3 chargrillerd.py --device akorn   # Force device type
+    python3 chargrillerd.py --platform mac   # Force macOS notifications
 
 Flow:
-    1. Scans BLE for devices matching "Gravity980-*" or "BLEWIFI APP"
+    1. Scans BLE for devices matching "Akorn-*", "Gravity980-*", or "BLEWIFI APP"
     2. Lets you pick one if multiple found
     3. Sends WiFi activate command [0x06] — uses stored credentials
     4. If stored credentials fail: sends auth handshake, scans for
        WiFi networks, provisions credentials via BLE, then activates
     5. Connects to device TCP port 3333, streams live status
     6. Serves web dashboard at http://localhost:<port>
-    7. Logs session to CSV at ~/.gravity_bbq/logs/
-    8. Sends macOS notifications when probes reach target or alarm fires
+    7. Logs session to CSV at ~/.cgriller/logs/
+    8. Sends desktop notifications (macOS or Linux, auto-detected)
     9. Auto-reconnects (TCP retry 30s, then BLE re-activation) on connection loss
     10. Detects device power loss within 5 seconds (no-data timeout)
 
@@ -72,28 +74,60 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
+import urllib.error
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
+# ==============================================================================
+# CONFIGURATION — Edit these settings or leave as None for auto-detect.
+#                 Command-line flags override these values.
+# ==============================================================================
+
+DEVICE = None               # "gravity", "akorn", or None for auto-detect
+PLATFORM = None             # "mac", "linux", or None for auto-detect
+ADAPTER = None              # BLE adapter e.g. "hci0", or None for default
+DEVICE_IP = None            # Known device IP e.g. "192.168.86.113", or None
+PORT = 8080                 # Web dashboard port
+NOTIFICATIONS = "desktop"   # "desktop", "ntfy", "both", or "none"
+NTFY_URL = None             # ntfy server e.g. "https://ntfy.sh"
+NTFY_TOPIC = None           # ntfy topic e.g. "my-grill"
+ALARM_SOUND = None          # Path to alarm audio file, or None for system default
+MAX_TEMP = 500              # Graph Y-axis max (°F)
+CHAMBER_ALARM_RANGE = 25    # Chamber alarms if temp is this many °F over or under target
+DEBUG = False               # Print BLE packet data
+
+# ==============================================================================
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Gravity BBQ Controller — Command Line Monitor. "
-                    "Connects to a Gravity980 temperature controller via BLE, "
-                    "bootstraps it onto WiFi, and streams live status.",
+        description="chargrillerd - Char-Griller BBQ Monitor. "
+                    "Supports Gravity 980 and Auto Akorn.",
         epilog="Examples:\n"
-               "  %(prog)s              Connect via BLE (default)\n"
-               "  %(prog)s --wifi       Skip BLE, find device on WiFi\n"
-               "  %(prog)s --ip 192.168.0.151  Connect to known IP directly\n"
-               "  %(prog)s --disconnect Disconnect device from WiFi and exit\n",
+               "  %(prog)s                    Auto-detect device via BLE\n"
+               "  %(prog)s --ip 192.168.0.151 Connect to known IP directly\n"
+               "  %(prog)s --device akorn     Force device type\n"
+               "  %(prog)s --platform mac     Force macOS notifications\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--device", choices=["auto", "gravity", "akorn"],
+        default=DEVICE or "auto",
+        help="Device type (default: auto-detect from BLE name)"
+    )
+    parser.add_argument(
+        "--platform", choices=["auto", "mac", "linux"],
+        default=PLATFORM or "auto",
+        help="Platform for notifications (default: auto-detect)"
     )
     parser.add_argument(
         "--wifi", action="store_true",
         help="Skip BLE and scan local subnet for device on WiFi instead"
     )
     parser.add_argument(
-        "--ip", metavar="ADDRESS",
+        "--ip", metavar="ADDRESS", default=DEVICE_IP,
         help="Connect directly to a known device IP (skip all discovery)"
     )
     parser.add_argument(
@@ -109,11 +143,15 @@ def parse_args():
         help=argparse.SUPPRESS  # deprecated, kept for backwards compat
     )
     parser.add_argument(
-        "--port", type=int, default=8080, metavar="PORT",
+        "--port", type=int, default=PORT, metavar="PORT",
         help="Web server port for status dashboard (default: 8080)"
     )
     parser.add_argument(
-        "--debug", action="store_true",
+        "--adapter", metavar="HCI", default=ADAPTER,
+        help="Bluetooth adapter to use (e.g. hci0, hci1). Default: system default"
+    )
+    parser.add_argument(
+        "--debug", action="store_true", default=DEBUG,
         help="Print all BLE packet data for debugging"
     )
     parser.add_argument(
@@ -121,14 +159,14 @@ def parse_args():
         help="Resume a previous session by loading its CSV log (path to .csv file)"
     )
     parser.add_argument(
-        "--max-temp", type=int, default=500, metavar="DEGREES",
+        "--max-temp", type=int, default=MAX_TEMP, metavar="DEGREES",
         help="Maximum temperature for graph Y-axis scaling (default: 500°F). "
              "Readings above this are clamped in the graph to prevent spikes from ruining scale."
     )
     parser.add_argument(
         "--alarm-sound", metavar="FILE",
-        default="/System/Library/Sounds/Basso.aiff",
-        help="Audio file to play for alarms (default: /System/Library/Sounds/Basso.aiff)"
+        default=ALARM_SOUND,
+        help="Audio file for alarms (default: system sound based on platform)"
     )
     parser.add_argument(
         "--p1-low", metavar="°F",
@@ -159,6 +197,61 @@ def parse_args():
 
 ARGS = parse_args()
 
+# --- Platform Detection ---
+
+def detect_platform():
+    if ARGS.platform != "auto":
+        return ARGS.platform
+    return "mac" if sys.platform == "darwin" else "linux"
+
+_PLATFORM = detect_platform()
+
+if ARGS.alarm_sound is None:
+    if _PLATFORM == "mac":
+        ARGS.alarm_sound = "/System/Library/Sounds/Basso.aiff"
+    else:
+        ARGS.alarm_sound = "/usr/share/sounds/Yaru/stereo/dialog-error.oga"
+
+# --- Device Profiles ---
+
+DEVICE_PROFILES = {
+    "gravity": {
+        "name": "Gravity 980",
+        "ble_match": "Gravity",
+        "show_door": True,
+        "show_fan": True,
+        "cli_title": "GRAVITY 980 STATUS",
+        "web_title": "Gravity 980 Monitor",
+    },
+    "akorn": {
+        "name": "Auto Akorn",
+        "ble_match": "Akorn",
+        "show_door": False,
+        "show_fan": True,
+        "cli_title": "AUTO AKORN STATUS",
+        "web_title": "Auto Akorn Monitor",
+    },
+}
+
+# Will be set after BLE scan or from --device flag
+DEVICE_PROFILE = DEVICE_PROFILES.get(ARGS.device) if ARGS.device != "auto" else None
+
+def detect_device_from_name(ble_name: str):
+    """Auto-detect device profile from BLE advertised name."""
+    global DEVICE_PROFILE
+    if DEVICE_PROFILE:
+        return  # already set by --device flag
+    if "Akorn" in ble_name:
+        DEVICE_PROFILE = DEVICE_PROFILES["akorn"]
+    elif "Gravity" in ble_name:
+        DEVICE_PROFILE = DEVICE_PROFILES["gravity"]
+    else:
+        DEVICE_PROFILE = DEVICE_PROFILES["akorn"]  # default fallback
+
+def get_profile():
+    """Get current device profile, defaulting to akorn."""
+    return DEVICE_PROFILE or DEVICE_PROFILES["akorn"]
+
 try:
     from bleak import BleakClient, BleakScanner
 except ImportError:
@@ -181,7 +274,7 @@ MSG_TYPE_WIFI_INFO = 0x07
 # --- TCP Protocol Constants ---
 
 TCP_PORT = 3333
-STATUS_PACKET_SIZE = 16
+STATUS_PACKET_SIZE = 20
 
 # --- Sentinel Values ---
 
@@ -195,14 +288,56 @@ TURBO_BIT = 0x10               # Byte 15, bit 4
 
 # --- Persistence & Notifications ---
 
-CACHE_DIR = Path.home() / ".gravity_bbq"
+CACHE_DIR = Path.home() / ".cgriller"
 CACHE_FILE = CACHE_DIR / "device_cache.json"
 LOG_DIR = CACHE_DIR / "logs"
+SESSIONS_FILE = CACHE_DIR / "sessions.json"
 
 
 def ensure_cache_dir():
     CACHE_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
+
+
+def load_sessions_meta() -> dict:
+    """Load session metadata (names, notes) from sessions.json."""
+    if SESSIONS_FILE.exists():
+        try:
+            return json.loads(SESSIONS_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_sessions_meta(data: dict):
+    SESSIONS_FILE.write_text(json.dumps(data, indent=2))
+
+
+def list_sessions() -> list[dict]:
+    """List all session CSV files with metadata."""
+    meta = load_sessions_meta()
+    sessions = []
+    for csv_file in sorted(LOG_DIR.glob("session_*.csv"), reverse=True):
+        name = csv_file.stem
+        stat = csv_file.stat()
+        info = meta.get(name, {})
+        sessions.append({
+            "file": name,
+            "path": str(csv_file),
+            "label": info.get("label", ""),
+            "size": stat.st_size,
+            "modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime)),
+        })
+    return sessions
+
+
+def rename_session(file_stem: str, label: str):
+    """Set a friendly label for a session."""
+    meta = load_sessions_meta()
+    if file_stem not in meta:
+        meta[file_stem] = {}
+    meta[file_stem]["label"] = label
+    save_sessions_meta(meta)
 
 
 def save_device_cache(ble_address: str, ip: str):
@@ -220,41 +355,32 @@ def load_device_cache() -> dict | None:
     return None
 
 
-def notify_macos(title: str, message: str, critical: bool = False):
+def send_notification(title: str, message: str, critical: bool = False):
     """
-    Send a macOS notification.
-    If critical=True, shows a modal dialog with repeating alert sound
-    that stays on screen until dismissed.
+    Send notifications based on NOTIFICATIONS setting.
+    Supports desktop (mac/linux auto-detected), ntfy, both, or none.
     """
+    mode = NOTIFICATIONS or "desktop"
+    if mode in ("desktop", "both"):
+        if _PLATFORM == "mac":
+            _notify_mac(title, message, critical)
+        else:
+            _notify_linux(title, message, critical)
+    if mode in ("ntfy", "both"):
+        _notify_ntfy(title, message, critical)
+
+
+def _notify_mac(title: str, message: str, critical: bool):
     if critical:
-        # Modal alert with repeating sound — sound loops until user dismisses dialog
-        def _alert():
-            subprocess.run([
-                "osascript", "-e",
-                'tell application "System Events"\n'
-                f'set alertResult to display alert "{title}" message "{message}" as critical\n'
-                'end tell'
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        def _sound_loop():
-            # Write a flag file; alert thread removes it when dismissed
-            flag = Path("/tmp/.gravity_alert_active")
-            flag.touch()
-            while flag.exists():
-                subprocess.run(["afplay", "-v", "2", ARGS.alarm_sound],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
         def _combined():
-            flag = Path("/tmp/.gravity_alert_active")
+            flag = Path("/tmp/.cgriller_alert_active")
             flag.touch()
-            sound_thread = threading.Thread(target=_sound_loop, daemon=True)
+            sound_thread = threading.Thread(target=lambda: _mac_sound_loop(flag), daemon=True)
             sound_thread.start()
-            # This blocks until user clicks OK
             subprocess.run([
                 "osascript", "-e",
                 f'display alert "{title}" message "{message}" as critical'
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            # Dialog dismissed — stop sound
             flag.unlink(missing_ok=True)
 
         threading.Thread(target=_combined, daemon=True).start()
@@ -266,6 +392,61 @@ def notify_macos(title: str, message: str, critical: bool = False):
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             pass
+
+
+def _mac_sound_loop(flag):
+    while flag.exists():
+        subprocess.run(["afplay", "-v", "2", ARGS.alarm_sound],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _notify_linux(title: str, message: str, critical: bool):
+    if critical:
+        def _combined():
+            flag = Path("/tmp/.cgriller_alert_active")
+            flag.touch()
+            try:
+                subprocess.Popen([
+                    "notify-send", "--urgency=critical", title, message
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+            while flag.exists():
+                try:
+                    subprocess.run(
+                        ["paplay", ARGS.alarm_sound],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=10
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    time.sleep(1)
+
+        threading.Thread(target=_combined, daemon=True).start()
+    else:
+        try:
+            subprocess.Popen([
+                "notify-send", title, message
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+
+def _notify_ntfy(title: str, message: str, critical: bool):
+    """Send notification via ntfy (https://ntfy.sh or self-hosted)."""
+    url = NTFY_URL
+    topic = NTFY_TOPIC
+    if not url or not topic:
+        return
+    try:
+        full_url = f"{url.rstrip('/')}/{topic}"
+        req = urllib.request.Request(full_url, data=message.encode())
+        req.add_header("Title", title)
+        if critical:
+            req.add_header("Priority", "urgent")
+            req.add_header("Tags", "fire")
+        urllib.request.urlopen(req, timeout=5)
+    except (urllib.error.URLError, OSError):
+        pass
 
 
 @dataclass
@@ -285,7 +466,7 @@ class ProbeReading:
 
 @dataclass
 class DeviceStatus:
-    """Parsed 16-byte device status."""
+    """Parsed 20-byte device status."""
     probe1: ProbeReading
     probe2: ProbeReading
     probe3: ProbeReading
@@ -293,12 +474,14 @@ class DeviceStatus:
     fan_on: bool
     fan_turbo: bool
     door_open: bool
+    fan_auto: bool
+    fan_speed: int  # 0-100%
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "DeviceStatus":
-        """Parse a 16-byte status packet into structured data."""
-        if len(data) < STATUS_PACKET_SIZE:
-            raise ValueError(f"Expected {STATUS_PACKET_SIZE} bytes, got {len(data)}")
+        """Parse a 20-byte status packet into structured data."""
+        if len(data) < 16:
+            raise ValueError(f"Expected at least 16 bytes, got {len(data)}")
 
         p1_cur = struct.unpack(">H", data[0:2])[0]
         p1_set = struct.unpack(">H", data[2:4])[0]
@@ -310,6 +493,13 @@ class DeviceStatus:
         p3_set = struct.unpack(">H", data[12:14])[0]
         fan_byte = data[14]
         status_byte = data[15]
+
+        # Extended bytes (16-19) — fan mode/speed
+        fan_auto = True
+        fan_speed = 0
+        if len(data) >= 18:
+            fan_auto = (data[16] == 0x10)
+            fan_speed = data[17]
 
         return cls(
             probe1=ProbeReading(
@@ -328,6 +518,8 @@ class DeviceStatus:
             fan_on=bool(fan_byte & FAN_ON_BIT),
             fan_turbo=bool(status_byte & TURBO_BIT),
             door_open=bool(status_byte & DOOR_OPEN_BIT),
+            fan_auto=fan_auto,
+            fan_speed=fan_speed,
         )
 
     def format_display(self) -> str:
@@ -335,7 +527,7 @@ class DeviceStatus:
         W = 42  # inner width between ║ bars
         lines = []
         lines.append("╔" + "═" * W + "╗")
-        lines.append("║" + "GRAVITY BBQ CONTROLLER STATUS".center(W) + "║")
+        lines.append("║" + get_profile()["cli_title"].center(W) + "║")
         lines.append("╠" + "═" * W + "╣")
 
         for name, probe in [("Probe 1 (Chamber)", self.probe1), ("Probe 2 (Food)   ", self.probe2), ("Probe 3 (Food)   ", self.probe3)]:
@@ -347,15 +539,18 @@ class DeviceStatus:
             lines.append("║" + content.ljust(W) + "║")
 
         lines.append("╠" + "═" * W + "╣")
-
-        if self.fan_on and self.fan_turbo:
-            fan_str = "TURBO"
-        elif self.fan_on:
-            fan_str = "ON"
-        else:
-            fan_str = "OFF"
-        content = f"  Fan: {fan_str}  |  Door: {'OPEN' if self.door_open else 'CLOSED'}"
-        lines.append("║" + content.ljust(W) + "║")
+        profile = get_profile()
+        if profile["show_fan"]:
+            if self.fan_auto:
+                fan_str = "Auto"
+            elif self.fan_speed == 0:
+                fan_str = "Off"
+            else:
+                fan_str = f"{self.fan_speed}%"
+            content = f"  Fan: {fan_str}"
+            if profile["show_door"]:
+                content += f"  |  Door: {'OPEN' if self.door_open else 'CLOSED'}"
+            lines.append("║" + content.ljust(W) + "║")
 
         if self.alarm_firing:
             content = "  *** ALARM FIRING ***"
@@ -375,9 +570,28 @@ class WifiInfo:
     gateway: str
 
     @classmethod
+    def from_status_notification(cls, data: bytes) -> "WifiInfo":
+        """
+        Parse a type-0x00/subtype-0x20 BLE notification (Akorn format).
+        Format: [0x00][0x20][len_lo][len_hi][0x00][ssid_len][ssid...][bssid x6][ip x4][mask x4][gw x4]
+        """
+        ssid_len = data[5]
+        offset = 6
+        ssid = data[offset:offset + ssid_len].decode("utf-8", errors="replace")
+        offset += ssid_len
+        bssid = ":".join(f"{b:02X}" for b in data[offset:offset + 6])
+        offset += 6
+        ip = ".".join(str(b) for b in data[offset:offset + 4])
+        offset += 4
+        netmask = ".".join(str(b) for b in data[offset:offset + 4])
+        offset += 4
+        gateway = ".".join(str(b) for b in data[offset:offset + 4])
+        return cls(ssid=ssid, bssid=bssid, ip=ip, netmask=netmask, gateway=gateway)
+
+    @classmethod
     def from_notification(cls, data: bytes) -> "WifiInfo":
         """
-        Parse a type-0x07 BLE notification payload.
+        Parse a type-0x07 BLE notification payload (Gravity 980 format).
         Format: [type=0x07][status][signal][reserved x2][ssid_len][ssid...][bssid x6][ip x4][mask x4][gw x4]
         """
         if data[0] != MSG_TYPE_WIFI_INFO:
@@ -404,25 +618,32 @@ class WifiInfo:
 
 # --- BLE Functions ---
 
-async def scan_for_gravity_devices(timeout: float = 8.0) -> list[tuple[str, str, int]]:
+async def scan_for_devices(timeout: float = 8.0) -> list[tuple[str, str, int]]:
     """
-    Scan for Gravity BLE devices.
-    The device may advertise as "Gravity980-XX:XX" or "BLEWIFI APP" depending
-    on timing and firmware state. We match both patterns.
-    Returns list of (address, name, rssi) tuples.
+    Scan for Char-Griller BLE devices (Akorn and/or Gravity).
+    Returns list of (address, name, rssi, adapter) tuples.
     """
-    print(f"Scanning for Gravity devices ({timeout}s)...")
-    devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
+    adapter = ARGS.adapter
+    if adapter:
+        print(f"Scanning for Char-Griller devices ({timeout}s, adapter: {adapter})...")
+    else:
+        print(f"Scanning for Char-Griller devices ({timeout}s)...")
 
-    gravity_devices = []
+    kwargs = {"timeout": timeout, "return_adv": True}
+    if adapter:
+        kwargs["adapter"] = adapter
+
+    devices = await BleakScanner.discover(**kwargs)
+
+    found_devices = []
     for addr, (device, adv_data) in devices.items():
-        if device.name and ("Gravity" in device.name or "BLEWIFI" in device.name):
-            gravity_devices.append((device.address, device.name, adv_data.rssi))
+        if device.name and ("Akorn" in device.name or "Gravity" in device.name or "BLEWIFI" in device.name):
+            found_devices.append((device.address, device.name, adv_data.rssi, adapter))
 
-    return gravity_devices
+    return found_devices
 
 
-async def ble_activate_wifi(device_address: str) -> WifiInfo | None:
+async def ble_activate_wifi(device_address: str, adapter: str | None = None) -> WifiInfo | None:
     """
     Connect to device via BLE, send WiFi activate command, return connection info.
 
@@ -444,7 +665,7 @@ async def ble_activate_wifi(device_address: str) -> WifiInfo | None:
 
     print(f"Connecting to {device_address} via BLE...")
     try:
-        async with BleakClient(device_address, timeout=15.0) as client:
+        async with BleakClient(device_address, timeout=15.0, adapter=adapter) as client:
             print("Connected. Subscribing to notifications...")
             await client.start_notify(NOTIFY_CHAR_UUID, notification_handler)
 
@@ -465,7 +686,7 @@ async def ble_activate_wifi(device_address: str) -> WifiInfo | None:
     return wifi_info
 
 
-async def ble_disconnect_wifi(device_address: str) -> bool:
+async def ble_disconnect_wifi(device_address: str, adapter: str | None = None) -> bool:
     """
     Connect to device via BLE and send the WiFi disconnect command [0x05, 0x00, 0x00, 0x00].
     The device responds with a notification that crashes bleak's service cache — this is
@@ -482,7 +703,7 @@ async def ble_disconnect_wifi(device_address: str) -> bool:
         pass
 
     try:
-        async with BleakClient(device_address, timeout=10.0) as client:
+        async with BleakClient(device_address, timeout=10.0, adapter=adapter) as client:
             await client.start_notify(NOTIFY_CHAR_UUID, handler)
             await asyncio.sleep(1)
             await client.write_gatt_char(WRITE_CHAR_UUID, bytes([0x05, 0x00, 0x00, 0x00]), response=False)
@@ -601,11 +822,11 @@ async def ble_provision_wifi(client, bssid: bytes, password: str, security_type:
     await asyncio.sleep(2)
 
 
-async def ble_full_provision(device_address: str, ssid: str | None = None, password: str | None = None) -> WifiInfo | None:
+async def ble_full_provision(device_address: str, adapter: str | None = None, ssid: str | None = None, password: str | None = None) -> WifiInfo | None:
     """
     Full WiFi provisioning flow over BLE.
     Uses a single notification subscription for the entire session to avoid
-    CoreBluetooth service discovery issues on macOS.
+    BLE service discovery issues.
     """
     wifi_info = None
     wifi_event = asyncio.Event()
@@ -619,7 +840,15 @@ async def ble_full_provision(device_address: str, ssid: str | None = None, passw
         if len(data) > 0 and data[0] == MSG_TYPE_WIFI_INFO:
             info = WifiInfo.from_notification(data)
             if ARGS.debug:
-                print(f"    -> WiFi info: SSID='{info.ssid}' IP={info.ip}")
+                print(f"    -> WiFi info (0x07): SSID='{info.ssid}' IP={info.ip}")
+            if info.ip != "0.0.0.0":
+                wifi_info = info
+                wifi_event.set()
+        elif data[0] == 0x00 and len(data) > 4 and data[1] == 0x20:
+            # Akorn-style WiFi connected notification
+            info = WifiInfo.from_status_notification(data)
+            if ARGS.debug:
+                print(f"    -> WiFi info (0x20): SSID='{info.ssid}' IP={info.ip}")
             if info.ip != "0.0.0.0":
                 wifi_info = info
                 wifi_event.set()
@@ -644,9 +873,9 @@ async def ble_full_provision(device_address: str, ssid: str | None = None, passw
                     ))
                     last_scan_time[0] = time.time()
 
-    print(f"Connecting to {device_address} via BLE...")
+    print(f"Connecting to {device_address} via BLE (adapter: {adapter or 'default'})...")
     try:
-        async with BleakClient(device_address, timeout=15.0) as client:
+        async with BleakClient(device_address, timeout=15.0, adapter=adapter) as client:
             await client.start_notify(NOTIFY_CHAR_UUID, handler)
             await asyncio.sleep(1)
 
@@ -744,7 +973,10 @@ async def ble_full_provision(device_address: str, ssid: str | None = None, passw
                 print("Timeout waiting for WiFi connection.")
 
     except Exception as e:
+        import traceback
         print(f"BLE error: {e}")
+        if ARGS.debug:
+            traceback.print_exc()
 
     return wifi_info
 
@@ -781,14 +1013,16 @@ class StatusHistory:
         # CSV log file
         ensure_cache_dir()
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.csv_path = LOG_DIR / f"session_{timestamp}.csv"
+        self.session_name = f"session_{timestamp}"
+        self.csv_path = LOG_DIR / f"{self.session_name}.csv"
         self.csv_file = open(self.csv_path, "w", newline="")
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
             "elapsed_sec", "timestamp",
             "probe1_cur", "probe1_set", "probe2_cur", "probe2_set",
             "probe3_cur", "probe3_set",
-            "fan", "turbo", "door", "alarm"
+            "fan", "turbo", "door", "alarm",
+            "fan_auto", "fan_speed"
         ])
 
     def add(self, status: DeviceStatus):
@@ -805,6 +1039,8 @@ class StatusHistory:
             "turbo": status.fan_turbo,
             "door": status.door_open,
             "alarm": status.alarm_firing,
+            "fan_auto": status.fan_auto,
+            "fan_speed": status.fan_speed,
         }
 
         with self.lock:
@@ -820,6 +1056,7 @@ class StatusHistory:
             status.probe3.current, status.probe3.set_temp,
             int(status.fan_on), int(status.fan_turbo),
             int(status.door_open), int(status.alarm_firing),
+            int(status.fan_auto), status.fan_speed,
         ])
         self.csv_file.flush()
 
@@ -838,16 +1075,17 @@ class StatusHistory:
 
         if status.alarm_firing and not prev.alarm_firing:
             self._add_event(elapsed, "alarm", "Alarm firing")
-            notify_macos("Gravity BBQ", "Alarm is firing!", critical=True)
+            send_notification(get_profile()["name"], "Alarm is firing!", critical=True)
         elif not status.alarm_firing and prev.alarm_firing:
             self._add_event(elapsed, "alarm", "Alarm dismissed")
 
-        if status.fan_turbo and not prev.fan_turbo:
-            self._add_event(elapsed, "fan", "Fan turbo")
-        elif status.fan_on and not prev.fan_on:
-            self._add_event(elapsed, "fan", "Fan on")
-        elif not status.fan_on and prev.fan_on:
-            self._add_event(elapsed, "fan", "Fan off")
+        if status.fan_auto != prev.fan_auto or status.fan_speed != prev.fan_speed:
+            if status.fan_auto:
+                self._add_event(elapsed, "fan", "Fan auto")
+            elif status.fan_speed == 0:
+                self._add_event(elapsed, "fan", "Fan off")
+            else:
+                self._add_event(elapsed, "fan", f"Fan {status.fan_speed}%")
 
         for name, probe in [("Probe 1", status.probe1), ("Probe 2", status.probe2), ("Probe 3", status.probe3)]:
             if probe.connected and probe.has_target and probe.current is not None:
@@ -855,7 +1093,7 @@ class StatusHistory:
                 if probe.current >= probe.set_temp and key not in self.notified_targets:
                     self.notified_targets.add(key)
                     self._add_event(elapsed, "target", f"{name} reached {probe.set_temp}°F")
-                    notify_macos("Gravity BBQ", f"{name} reached target ({probe.set_temp}°F)!", critical=True)
+                    send_notification(get_profile()["name"], f"{name} reached target ({probe.set_temp}°F)!", critical=True)
 
         # Check user-configurable alarm bounds
         for probe_key, probe in [("probe1", status.probe1), ("probe2", status.probe2), ("probe3", status.probe3)]:
@@ -876,7 +1114,7 @@ class StatusHistory:
                     self.bounds_triggered.add(trigger_key)
                     label = f"{probe_key.replace('probe', 'Probe ')} below {low}°F ({probe.current}°F)"
                     self._add_event(elapsed, "alarm", label)
-                    notify_macos("Gravity BBQ", label, critical=True)
+                    send_notification(get_profile()["name"], label, critical=True)
             elif low is not None and f"{probe_key}_low" in self.bounds_triggered:
                 self.bounds_triggered.discard(f"{probe_key}_low")
 
@@ -886,7 +1124,7 @@ class StatusHistory:
                     self.bounds_triggered.add(trigger_key)
                     label = f"{probe_key.replace('probe', 'Probe ')} above {high}°F ({probe.current}°F)"
                     self._add_event(elapsed, "alarm", label)
-                    notify_macos("Gravity BBQ", label, critical=True)
+                    send_notification(get_profile()["name"], label, critical=True)
             elif high is not None and f"{probe_key}_high" in self.bounds_triggered:
                 self.bounds_triggered.discard(f"{probe_key}_high")
 
@@ -917,13 +1155,17 @@ class StatusHistory:
                 "probe2": {"current": s.probe2.current, "set": s.probe2.set_temp, "connected": s.probe2.connected},
                 "probe3": {"current": s.probe3.current, "set": s.probe3.set_temp, "connected": s.probe3.connected},
                 "fan": s.fan_on,
+                "fan_auto": s.fan_auto,
+                "fan_speed": s.fan_speed,
                 "turbo": s.fan_turbo,
                 "door": s.door_open,
                 "alarm": s.alarm_firing,
+                "device": get_profile(),
                 "timestamp": time.strftime("%H:%M:%S"),
                 "stats": stats,
                 "session_minutes": round((time.time() - self.start_time) / 60, 1),
                 "max_temp": ARGS.max_temp,
+                "chamber_alarm_range": CHAMBER_ALARM_RANGE,
                 "bounds": {
                     k: {
                         "low": v["low"] if v["low"] != "set" else (getattr(s, k).set_temp if hasattr(s, k) else None),
@@ -978,7 +1220,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Gravity BBQ Monitor</title>
+<title>Char-Griller Monitor</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }
   h1 { text-align: center; color: #ff6b35; margin-bottom: 5px; }
@@ -1005,12 +1247,48 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   canvas { width: 100% !important; height: 300px !important; }
   .disconnected { text-align: center; color: #666; font-size: 24px; }
   .conn-lost { display: none; background: #e74c3c; color: #fff; text-align: center; padding: 12px; font-weight: bold; border-radius: 8px; max-width: 900px; margin: 0 auto 15px; animation: pulse 1.5s infinite; }
+  .alarm-row { display: flex; gap: 6px; margin-top: 8px; justify-content: center; align-items: center; }
+  .alarm-input { width: 60px; background: #0f3460; border: 1px solid #1a4a8a; color: #eee; padding: 4px 6px; border-radius: 4px; font-size: 12px; text-align: center; }
+  .alarm-input::placeholder { color: #555; }
+  .alarm-label { font-size: 11px; color: #666; }
+  .alarm-set-btn { background: #0f3460; border: 1px solid #1a4a8a; color: #ff6b35; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; }
+  .alarm-set-btn:hover { background: #1a4a8a; }
+  .settings-bar { display: flex; gap: 8px; align-items: center; justify-content: center; max-width: 900px; margin: 0 auto 15px; font-size: 12px; color: #888; }
+  .settings-label { color: #666; }
+  .fan-control { display: flex; gap: 6px; align-items: center; justify-content: center; margin-top: 8px; }
+  .fan-select { background: #0f3460; border: 1px solid #1a4a8a; color: #eee; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+  .alarm-banner { display: none; background: #e74c3c; color: #fff; text-align: center; padding: 14px; font-weight: bold; font-size: 18px; border-radius: 8px; max-width: 900px; margin: 0 auto 15px; animation: pulse 0.5s infinite; cursor: pointer; }
 </style>
 </head>
 <body>
-<h1>Gravity BBQ Monitor</h1>
+<h1 id="deviceTitle">Char-Griller Monitor</h1>
 <div class="subtitle" id="timestamp">Connecting...</div>
 <div class="conn-lost" id="conn-status">CONNECTION LOST — Server is not responding</div>
+<div class="alarm-banner" id="alarm-banner" onclick="dismissAlarm()">ALARM — Click to dismiss</div>
+<div class="settings-bar" id="sessionBar">
+  <span class="settings-label">Session:</span>
+  <span id="sessionName" style="color:#ff6b35;cursor:pointer" onclick="renameCurrentSession()" title="Click to rename"></span>
+  <button class="alarm-set-btn" onclick="renameCurrentSession()">Rename</button>
+  <button class="alarm-set-btn" onclick="showSessions()">History</button>
+</div>
+<div id="sessionList" style="display:none;max-width:900px;margin:0 auto 15px;background:#16213e;border-radius:8px;padding:12px;border:1px solid #0f3460">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <span style="color:#aaa;font-size:13px;font-weight:bold">Past Sessions</span>
+    <button class="alarm-set-btn" onclick="document.getElementById('sessionList').style.display='none'">Close</button>
+  </div>
+  <div id="sessionListItems" style="max-height:200px;overflow-y:auto"></div>
+</div>
+<div class="settings-bar" id="settingsBar">
+  <span class="settings-label">Alarm:</span>
+  <select class="fan-select" onchange="setTone(this.value)" id="toneSelect">
+    <option value="beep">Beep</option>
+    <option value="siren">Siren</option>
+    <option value="chime">Chime</option>
+    <option value="urgent">Urgent</option>
+  </select>
+  <button class="alarm-set-btn" onclick="testTone()">Test</button>
+  <button class="alarm-set-btn" id="muteBtn" onclick="toggleMute()">Mute</button>
+</div>
 <div class="grid" id="cards"></div>
 <div class="grid2" id="controls"></div>
 <div class="chart-container">
@@ -1191,44 +1469,301 @@ function drawChart() {
   }
 }
 
+// --- Session Management ---
+let currentSessionFile = '';
+let currentSessionLabel = '';
+
+function loadSessionInfo() {
+  fetch('/api/sessions').then(r => r.json()).then(data => {
+    currentSessionFile = data.current;
+    currentSessionLabel = data.current_label;
+    const el = document.getElementById('sessionName');
+    el.textContent = currentSessionLabel || currentSessionFile;
+  });
+}
+
+function renameCurrentSession() {
+  const name = prompt('Session name:', currentSessionLabel || '');
+  if (name === null) return;
+  fetch('/api/session/rename', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({file: currentSessionFile, label: name})
+  }).then(() => {
+    currentSessionLabel = name;
+    document.getElementById('sessionName').textContent = name || currentSessionFile;
+  });
+}
+
+function showSessions() {
+  const panel = document.getElementById('sessionList');
+  if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+  fetch('/api/sessions').then(r => r.json()).then(data => {
+    const el = document.getElementById('sessionListItems');
+    if (!data.sessions.length) { el.innerHTML = '<div style=\"color:#666;font-size:12px\">No sessions yet</div>'; }
+    else {
+      el.innerHTML = data.sessions.map(s => {
+        const isCurrent = s.file === data.current;
+        const label = s.label || s.file;
+        const sizeKB = Math.round(s.size / 1024);
+        return '<div style=\"display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #0f3460;font-size:12px\">'
+          + '<a href=\"/session/'+s.file+'\" target=\"_blank\" style=\"color:'+(isCurrent?'#ff6b35':'#2aa198')+';text-decoration:none\">'+(isCurrent?'>> ':'')+label+'</a>'
+          + '<span style=\"color:#666\">'+s.modified+' ('+sizeKB+'KB)</span>'
+          + '</div>';
+      }).join('');
+    }
+    panel.style.display = '';
+  });
+}
+
+loadSessionInfo();
+
+// --- Grill Command API ---
+function sendCommand(target, value) {
+  fetch('/api/command', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({target: target, value: value})
+  });
+}
+
+function silenceGrill() {
+  sendCommand('silence', 0);
+}
+
+function sendGrillTemp(probe, el) {
+  const val = el.value.trim();
+  if (val === '') return;
+  const num = parseInt(val);
+  if (!isNaN(num) && num > 0 && num < 1000) {
+    sendCommand(probe, num);
+  }
+}
+
+function setFan(val) {
+  if (val === 'auto') {
+    sendCommand('fan', 4096);  // 0x1000 = auto
+  } else {
+    sendCommand('fan', parseInt(val));
+  }
+}
+
+
+// --- Browser Alarm System ---
+let alarmFiring = false;
+let alarmInterval = null;
+let alarmCtx = null;
+let alarmMuted = localStorage.getItem('cgrillerMuted') === 'true';
+let alarmTone = localStorage.getItem('cgrillerTone') || 'beep';
+
+function getCtx() {
+  if (!alarmCtx) alarmCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return alarmCtx;
+}
+
+const TONES = {
+  beep: function() {
+    const ctx = getCtx(); const now = ctx.currentTime;
+    for (let i = 0; i < 3; i++) {
+      const osc = ctx.createOscillator(); const g = ctx.createGain();
+      osc.frequency.value = 880; g.gain.value = 0.3;
+      osc.connect(g); g.connect(ctx.destination);
+      osc.start(now + i * 0.25); osc.stop(now + i * 0.25 + 0.15);
+    }
+  },
+  siren: function() {
+    const ctx = getCtx(); const now = ctx.currentTime;
+    const osc = ctx.createOscillator(); const g = ctx.createGain();
+    osc.type = 'sawtooth'; g.gain.value = 0.2;
+    osc.frequency.setValueAtTime(600, now);
+    osc.frequency.linearRampToValueAtTime(1200, now + 0.3);
+    osc.frequency.linearRampToValueAtTime(600, now + 0.6);
+    osc.connect(g); g.connect(ctx.destination);
+    osc.start(now); osc.stop(now + 0.6);
+  },
+  chime: function() {
+    const ctx = getCtx(); const now = ctx.currentTime;
+    [523, 659, 784, 1047].forEach(function(freq, i) {
+      const osc = ctx.createOscillator(); const g = ctx.createGain();
+      osc.type = 'sine'; osc.frequency.value = freq;
+      g.gain.setValueAtTime(0.25, now + i * 0.2);
+      g.gain.exponentialRampToValueAtTime(0.01, now + i * 0.2 + 0.4);
+      osc.connect(g); g.connect(ctx.destination);
+      osc.start(now + i * 0.2); osc.stop(now + i * 0.2 + 0.4);
+    });
+  },
+  urgent: function() {
+    const ctx = getCtx(); const now = ctx.currentTime;
+    for (let i = 0; i < 5; i++) {
+      const osc = ctx.createOscillator(); const g = ctx.createGain();
+      osc.frequency.value = 1000; g.gain.value = 0.35;
+      osc.connect(g); g.connect(ctx.destination);
+      osc.start(now + i * 0.15); osc.stop(now + i * 0.15 + 0.08);
+    }
+  }
+};
+
+function playAlarmTone() {
+  if (alarmMuted) return;
+  (TONES[alarmTone] || TONES.beep)();
+}
+
+function testTone() {
+  (TONES[alarmTone] || TONES.beep)();
+}
+
+function setTone(val) {
+  alarmTone = val;
+  localStorage.setItem('cgrillerTone', val);
+}
+
+function toggleMute() {
+  alarmMuted = !alarmMuted;
+  localStorage.setItem('cgrillerMuted', alarmMuted);
+  document.getElementById('muteBtn').textContent = alarmMuted ? 'Unmute' : 'Mute';
+}
+
+function startAlarm(msg) {
+  if (alarmFiring) return;
+  alarmFiring = true;
+  document.getElementById('alarm-banner').textContent = msg + ' — Click to snooze 5 min';
+  document.getElementById('alarm-banner').style.display = 'block';
+  playAlarmTone();
+  alarmInterval = setInterval(playAlarmTone, 2000);
+}
+
+function dismissAlarm() {
+  alarmFiring = false;
+  if (alarmInterval) { clearInterval(alarmInterval); alarmInterval = null; }
+  document.getElementById('alarm-banner').style.display = 'none';
+  silenceGrill();
+}
+
+// Track which probes have fired — won't re-fire until temp drops below target
+let alarmFiredProbes = new Set();
+
+function checkAlarms(data) {
+  if (alarmFiring) return;
+  const probes = [
+    {key: 'probe1', name: 'Chamber', d: data.probe1},
+    {key: 'probe2', name: 'Probe 2', d: data.probe2},
+    {key: 'probe3', name: 'Probe 3', d: data.probe3}
+  ];
+  for (const p of probes) {
+    if (!p.d.connected || p.d.set === null) continue;
+    const range = data.chamber_alarm_range || 25;
+    if (p.key === 'probe1') {
+      // Chamber: alarm if temp drifts too far from target (over or under)
+      const overKey = p.key + '_over';
+      const underKey = p.key + '_under';
+      if (p.d.current >= p.d.set + range) {
+        if (!alarmFiredProbes.has(overKey)) {
+          alarmFiredProbes.add(overKey);
+          startAlarm(p.name + ' is ' + (p.d.current - p.d.set) + ' over target (' + p.d.current + '/' + p.d.set + ')');
+          return;
+        }
+      } else { alarmFiredProbes.delete(overKey); }
+      if (p.d.current <= p.d.set - range) {
+        if (!alarmFiredProbes.has(underKey)) {
+          alarmFiredProbes.add(underKey);
+          startAlarm(p.name + ' is ' + (p.d.set - p.d.current) + ' under target (' + p.d.current + '/' + p.d.set + ')');
+          return;
+        }
+      } else { alarmFiredProbes.delete(underKey); }
+    } else {
+      // Food probes: alarm when target reached
+      if (p.d.current >= p.d.set) {
+        if (!alarmFiredProbes.has(p.key)) {
+          alarmFiredProbes.add(p.key);
+          startAlarm(p.name + ' reached target (' + p.d.current + '/' + p.d.set + ')');
+          return;
+        }
+      } else {
+        alarmFiredProbes.delete(p.key);
+      }
+    }
+  }
+}
+
 function updateUI(data) {
   document.getElementById('timestamp').textContent = 'Last update: ' + data.timestamp + ' | Session: ' + data.session_minutes + ' min';
   let html = '';
 
   const probes = [{name:'Probe 1 (Chamber)', key:'probe1', d:data.probe1}, {name:'Probe 2 (Food)', key:'probe2', d:data.probe2}, {name:'Probe 3 (Food)', key:'probe3', d:data.probe3}];
-  const activeEl = document.activeElement;
-  const activeProbe = activeEl && activeEl.dataset ? activeEl.dataset.probe : null;
-  const activeBound = activeEl && activeEl.dataset ? activeEl.dataset.bound : null;
   for (const p of probes) {
     if (p.d.connected) {
       const setHtml = p.d.set !== null ? '<div class=\"set\">Target: '+p.d.set+'°F</div>' : '';
-      const bounds = data.bounds ? data.bounds[p.key] : {low:null, high:null};
-      let boundsHtml = '';
-      if (bounds.low !== null || bounds.high !== null) {
-        const parts = [];
-        if (bounds.low !== null) parts.push('Low: '+bounds.low+'°F'+(bounds.low_is_set?' (set)':''));
-        if (bounds.high !== null) parts.push('High: '+bounds.high+'°F'+(bounds.high_is_set?' (set)':''));
-        boundsHtml = '<div class=\"set\">Alarm: '+parts.join(' | ')+'</div>';
+      let alarmHtml = '';
+      if (p.key === 'probe1') {
+        // Chamber: always sends to grill, no app/grill toggle
+        alarmHtml = '<div class=\"alarm-row\">'
+          + '<span class=\"alarm-label\">Set temp:</span>'
+          + '<input class=\"alarm-input\" id=\"alarm-'+p.key+'\" type=\"number\" min=\"1\" max=\"999\" placeholder=\"°F\" value=\"'+(p.d.set||'')+'\" '
+          + 'onfocus=\"this.select()\" '
+          + 'onblur=\"sendGrillTemp(\\''+p.key+'\\', this)\" '
+          + 'onkeydown=\"if(event.key===\\'Enter\\')this.blur()\">'
+          + '</div>';
+      } else {
+        // Food probes: send target to grill, alarm fires via grill's alarm byte
+        alarmHtml = '<div class=\"alarm-row\">'
+          + '<span class=\"alarm-label\">Set temp:</span>'
+          + '<input class=\"alarm-input\" id=\"alarm-'+p.key+'\" type=\"number\" min=\"1\" max=\"999\" placeholder=\"°F\" value=\"'+(p.d.set||'')+'\" '
+          + 'onfocus=\"this.select()\" '
+          + 'onblur=\"sendGrillTemp(\\''+p.key+'\\', this)\" '
+          + 'onkeydown=\"if(event.key===\\'Enter\\')this.blur()\">'
+          + '</div>';
       }
-      html += '<div class=\"card\"><h3>'+p.name+'</h3><div class=\"temp\">'+p.d.current+'°F</div>'+setHtml+boundsHtml+'</div>';
+      html += '<div class=\"card\"><h3>'+p.name+'</h3><div class=\"temp\">'+p.d.current+'°F</div>'+setHtml+alarmHtml+'</div>';
     } else {
       html += '<div class=\"card\"><h3>'+p.name+'</h3><div class=\"disconnected\">—</div><div class=\"set\">Not connected</div></div>';
     }
   }
 
-  // Fan + Door (same row)
-  let fanLabel = data.turbo ? 'TURBO' : (data.fan ? 'ON' : 'OFF');
-  let fanClass = data.fan ? 'on' : 'off';
-  let ctrlHtml = '<div class=\"card\"><h3>Fan</h3><span class=\"badge '+fanClass+'\">'+fanLabel+'</span></div>';
-  ctrlHtml += '<div class=\"card\"><h3>Door</h3><span class=\"badge '+(data.door?'alert':'off')+'\">'+(data.door?'OPEN':'Closed')+'</span></div>';
+  let ctrlHtml = '';
+  const dev = data.device || {};
+  if (dev.show_fan !== false) {
+    let fanLabel;
+    if (data.fan_auto) { fanLabel = 'Auto'; }
+    else if (data.fan_speed === 0) { fanLabel = 'Off'; }
+    else { fanLabel = data.fan_speed + '%'; }
+    let fanClass = (data.fan_auto || data.fan_speed > 0) ? 'on' : 'off';
+    let fanVal = data.fan_auto ? 'auto' : String(data.fan_speed);
+    ctrlHtml += '<div class=\"card\"><h3>Fan</h3><span class=\"badge '+fanClass+'\">'+fanLabel+'</span>'
+      + '<div class=\"fan-control\"><select class=\"fan-select\" onchange=\"setFan(this.value)\">'
+      + '<option value=\"auto\"'+(fanVal==='auto'?' selected':'')+'>Auto</option>'
+      + '<option value=\"0\"'+(fanVal==='0'?' selected':'')+'>Off</option>'
+      + '<option value=\"5\"'+(fanVal==='5'?' selected':'')+'>5%</option>'
+      + '<option value=\"20\"'+(fanVal==='20'?' selected':'')+'>20%</option>'
+      + '<option value=\"40\"'+(fanVal==='40'?' selected':'')+'>40%</option>'
+      + '<option value=\"60\"'+(fanVal==='60'?' selected':'')+'>60%</option>'
+      + '<option value=\"80\"'+(fanVal==='80'?' selected':'')+'>80%</option>'
+      + '<option value=\"100\"'+(fanVal==='100'?' selected':'')+'>100%</option>'
+      + '</select></div></div>';
+  }
+  if (dev.show_door !== false) {
+    ctrlHtml += '<div class=\"card\"><h3>Door</h3><span class=\"badge '+(data.door?'alert':'off')+'\">'+(data.door?'OPEN':'Closed')+'</span></div>';
+  }
+
+  if (dev.web_title) {
+    document.getElementById('deviceTitle').textContent = dev.web_title;
+    document.title = dev.web_title;
+  }
 
   // Alarm
   if (data.alarm) {
     html += '<div class=\"card alarm\"><h3>Alarm</h3><span class=\"badge alert\">FIRING</span></div>';
   }
 
-  document.getElementById('cards').innerHTML = html;
-  document.getElementById('controls').innerHTML = ctrlHtml;
+  // Don't rebuild while user is interacting with inputs or dropdowns
+  const focused = document.activeElement;
+  const isEditing = focused && (focused.classList.contains('alarm-input') || focused.classList.contains('fan-select'));
+  if (!isEditing) {
+    document.getElementById('cards').innerHTML = html;
+    document.getElementById('controls').innerHTML = ctrlHtml;
+  }
+
+  // Check browser alarms
+  checkAlarms(data);
 }
 
 async function poll() {
@@ -1257,15 +1792,266 @@ async function poll() {
 initChart();
 poll();
 window.addEventListener('resize', drawChart);
+// Init settings bar state
+document.getElementById('toneSelect').value = alarmTone;
+document.getElementById('muteBtn').textContent = alarmMuted ? 'Unmute' : 'Mute';
 </script>
+<div style="text-align:center;padding:20px 0 10px;font-size:11px;color:#555">
+  <a href="https://www.youtube.com/@RobsBackyardBBQ" target="_blank" rel="noopener" style="color:#666;text-decoration:none">Find my Char-Griller videos on Rob's Backyard BBQ (YouTube)</a>
+  <div style="margin-top:6px"><a href="https://github.com/kprojects/chargrillerd" target="_blank" rel="noopener" style="color:#444;text-decoration:none">Fork me on GitHub</a> &middot; MIT License</div>
+</div>
 </body>
 </html>"""
+
+
+SESSION_VIEW_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>__SESSION_LABEL__ - Session Replay</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }
+  h1 { text-align: center; color: #ff6b35; margin-bottom: 5px; font-size: 24px; }
+  .subtitle { text-align: center; color: #888; margin-bottom: 20px; font-size: 14px; }
+  .chart-container { max-width: 900px; margin: 0 auto; background: #16213e; border-radius: 10px; padding: 20px; border: 1px solid #0f3460; }
+  .chart-controls { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .chart-controls button { background: #0f3460; color: #eee; border: 1px solid #1a4a8a; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+  .chart-controls button:hover { background: #1a4a8a; }
+  .chart-controls button.active { background: #ff6b35; border-color: #ff6b35; }
+  .chart-controls span { color: #888; font-size: 12px; }
+  canvas { width: 100% !important; height: 400px !important; }
+  .stats { max-width: 900px; margin: 20px auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+  .stat-card { background: #16213e; border-radius: 8px; padding: 12px; border: 1px solid #0f3460; text-align: center; }
+  .stat-card h3 { color: #aaa; font-size: 11px; text-transform: uppercase; margin: 0 0 6px; }
+  .stat-val { color: #ff6b35; font-size: 20px; font-weight: bold; }
+  .stat-detail { color: #666; font-size: 11px; margin-top: 4px; }
+</style>
+</head>
+<body>
+<h1>__SESSION_LABEL__</h1>
+<div class="subtitle">Session replay (read-only) &middot; <a href="/" style="color:#2aa198">Back to live</a></div>
+
+<div class="stats" id="stats"></div>
+
+<div class="chart-container">
+  <div class="chart-controls">
+    <button onclick="setZoom('all')" id="z-all" class="active">All</button>
+    <button onclick="setZoom(5)" id="z-5">5m</button>
+    <button onclick="setZoom(15)" id="z-15">15m</button>
+    <button onclick="setZoom(30)" id="z-30">30m</button>
+    <button onclick="setZoom(60)" id="z-60">1h</button>
+    <button onclick="setZoom(120)" id="z-120">2h</button>
+    <span>|</span>
+    <button onclick="panChart(-1)">&larr;</button>
+    <button onclick="panChart(1)">&rarr;</button>
+    <button onclick="panChart(0)">Latest</button>
+    <span id="chart-range"></span>
+  </div>
+  <canvas id="chart"></canvas>
+</div>
+
+<script>
+let history = [];
+let zoomMinutes = 'all';
+let panOffset = 0;
+
+function setZoom(mins) {
+  zoomMinutes = mins;
+  panOffset = 0;
+  document.querySelectorAll('.chart-controls button[id^="z-"]').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('z-' + mins);
+  if (btn) btn.classList.add('active');
+  drawChart();
+}
+
+function panChart(dir) {
+  if (zoomMinutes === 'all') return;
+  const step = zoomMinutes * 60 * 0.25;
+  if (dir === 0) { panOffset = 0; }
+  else { panOffset += dir * step; }
+  if (panOffset < 0) panOffset = 0;
+  drawChart();
+}
+
+function drawChart() {
+  if (!history.length) return;
+  const canvas = document.getElementById('chart');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.clientWidth * dpr;
+  canvas.height = canvas.clientHeight * dpr;
+  ctx.scale(dpr, dpr);
+  const W = canvas.clientWidth;
+  const H = canvas.clientHeight;
+  ctx.clearRect(0, 0, W, H);
+
+  const maxT = history[history.length - 1].t;
+  let tMin = 0, tMax = maxT;
+  if (zoomMinutes !== 'all') {
+    const window_s = zoomMinutes * 60;
+    tMax = maxT - panOffset;
+    tMin = tMax - window_s;
+    if (tMin < 0) { tMin = 0; tMax = Math.min(window_s, maxT); }
+  }
+
+  const rangeEl = document.getElementById('chart-range');
+  function fmt(s) { const m = Math.floor(s/60); return m < 60 ? m+'m'+Math.floor(s%60)+'s' : Math.floor(m/60)+'h'+m%60+'m'; }
+  rangeEl.textContent = fmt(tMin) + ' - ' + fmt(tMax);
+
+  const pad = {top: 30, bottom: 30, left: 40, right: 10};
+  const plotW = W - pad.left - pad.right;
+  const plotH = H - pad.top - pad.bottom;
+
+  const visible = history.filter(e => e.t >= tMin && e.t <= tMax);
+  if (!visible.length) return;
+
+  let yMax = 0;
+  visible.forEach(e => {
+    if (e.p1 !== null && e.p1 > yMax) yMax = e.p1;
+    if (e.p2 !== null && e.p2 > yMax) yMax = e.p2;
+    if (e.p3 !== null && e.p3 > yMax) yMax = e.p3;
+    if (e.p1_set !== null && e.p1_set > yMax) yMax = e.p1_set;
+  });
+  yMax = Math.ceil(yMax * 1.15 / 10) * 10;
+  if (yMax < 50) yMax = 50;
+
+  function x(t) { return pad.left + (t - tMin) / (tMax - tMin) * plotW; }
+  function y(v) { return pad.top + plotH - (v / yMax) * plotH; }
+
+  // Grid
+  ctx.strokeStyle = '#1a3a5c'; ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 5; i++) {
+    const yy = pad.top + plotH * i / 5;
+    ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(W - pad.right, yy); ctx.stroke();
+    ctx.fillStyle = '#666'; ctx.font = '10px sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText(Math.round(yMax * (5 - i) / 5), pad.left - 5, yy + 3);
+  }
+
+  // Target line (dashed)
+  const lastSet = visible[visible.length-1].p1_set;
+  if (lastSet) {
+    ctx.strokeStyle = '#ff6b35'; ctx.lineWidth = 1; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(pad.left, y(lastSet)); ctx.lineTo(W-pad.right, y(lastSet)); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Draw lines
+  const series = [{key:'p1',color:'#ff6b35'},{key:'p2',color:'#3498db'},{key:'p3',color:'#f1c40f'}];
+  series.forEach(s => {
+    ctx.strokeStyle = s.color; ctx.lineWidth = 2; ctx.beginPath();
+    let started = false;
+    visible.forEach(e => {
+      if (e[s.key] !== null) {
+        const px = x(e.t), py = y(e[s.key]);
+        if (!started) { ctx.moveTo(px, py); started = true; } else { ctx.lineTo(px, py); }
+      }
+    });
+    if (started) ctx.stroke();
+  });
+
+  // Legend
+  ctx.font = '11px sans-serif';
+  let lx = pad.left + 5;
+  series.forEach(s => {
+    ctx.fillStyle = s.color;
+    ctx.fillRect(lx, pad.top - 18, 10, 10);
+    ctx.fillText(s.key === 'p1' ? 'Probe 1' : s.key === 'p2' ? 'Probe 2' : 'Probe 3', lx + 14, pad.top - 9);
+    lx += 80;
+  });
+}
+
+fetch('/api/session/data/__SESSION_NAME__').then(r => r.json()).then(data => {
+  history = data;
+  drawChart();
+
+  // Stats
+  const duration = data.length ? data[data.length-1].t : 0;
+  const durationStr = duration > 3600 ? Math.floor(duration/3600)+'h '+Math.floor(duration%3600/60)+'m' : Math.floor(duration/60)+'m';
+  const p1vals = data.filter(e => e.p1 !== null).map(e => e.p1);
+  const p3vals = data.filter(e => e.p3 !== null).map(e => e.p3);
+  let statsHtml = '<div class="stat-card"><h3>Duration</h3><div class="stat-val">'+durationStr+'</div><div class="stat-detail">'+data.length+' readings</div></div>';
+  if (p1vals.length) {
+    statsHtml += '<div class="stat-card"><h3>Chamber</h3><div class="stat-val">'+Math.round(p1vals.reduce((a,b)=>a+b)/p1vals.length)+'&deg;F avg</div><div class="stat-detail">'+Math.min(...p1vals)+'&deg; - '+Math.max(...p1vals)+'&deg;</div></div>';
+  }
+  if (p3vals.length) {
+    statsHtml += '<div class="stat-card"><h3>Probe 3</h3><div class="stat-val">'+Math.round(p3vals.reduce((a,b)=>a+b)/p3vals.length)+'&deg;F avg</div><div class="stat-detail">'+Math.min(...p3vals)+'&deg; - '+Math.max(...p3vals)+'&deg;</div></div>';
+  }
+  document.getElementById('stats').innerHTML = statsHtml;
+});
+
+window.addEventListener('resize', drawChart);
+</script>
+<div style="text-align:center;padding:20px 0 10px;font-size:11px;color:#555">
+  <a href="https://www.youtube.com/@RobsBackyardBBQ" target="_blank" rel="noopener" style="color:#666;text-decoration:none">Find my Char-Griller videos on Rob's Backyard BBQ (YouTube)</a>
+  <div style="margin-top:6px"><a href="https://github.com/kprojects/chargrillerd" target="_blank" rel="noopener" style="color:#444;text-decoration:none">Fork me on GitHub</a> &middot; MIT License</div>
+</div>
+</body>
+</html>"""
+
+
+import queue
+
+# Shared command queue — web server puts commands, TCP loop sends them
+_cmd_queue = queue.Queue()
+
+# TCP command format (no 0019 header for TCP)
+def build_tcp_cmd(probe_id: int, value: int) -> bytes:
+    return bytes([0x04, 0x00, 0xFF, probe_id, (value >> 8) & 0xFF, value & 0xFF])
+
+CMD_IDS = {
+    "probe1": 0x00,  # chamber target
+    "probe2": 0x02,  # probe 2 target
+    "probe3": 0x03,  # probe 3 target
+    "silence": 0x05, # silence alarm (value 0x0000)
+    "fan": 0x06,     # fan speed (0x1000 = auto)
+    # NOTE: timer (0x01) and power (0x04) use a different command format
+    # (m.b() full-packet builder, not simple m.d()). Do not use with this
+    # simple command structure — it corrupts grill state.
+}
 
 
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
     """HTTP request handler for the status dashboard."""
 
     history: StatusHistory = None  # set by start_web_server
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            if self.path == "/api/command":
+                target = body.get("target", "")
+                value = body.get("value")
+                if target in CMD_IDS and value is not None:
+                    cmd = build_tcp_cmd(CMD_IDS[target], int(value))
+                    _cmd_queue.put(cmd)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"ok": True, "sent": cmd.hex(" ")}).encode())
+                else:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"ok": False, "error": "Invalid target or value"}).encode())
+            elif self.path == "/api/session/rename":
+                file_stem = body.get("file", "")
+                label = body.get("label", "")
+                if file_stem:
+                    rename_session(file_stem, label)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"ok": True}).encode())
+                else:
+                    self.send_response(400)
+                    self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
 
     def do_GET(self):
         try:
@@ -1289,6 +2075,57 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(self.history.get_events_json().encode())
+            elif self.path == "/api/sessions":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                current = self.history.session_name
+                meta = load_sessions_meta()
+                current_label = meta.get(current, {}).get("label", "")
+                self.wfile.write(json.dumps({
+                    "current": current,
+                    "current_label": current_label,
+                    "sessions": list_sessions()
+                }).encode())
+            elif self.path.startswith("/api/session/data/"):
+                name = self.path.split("/")[-1]
+                csv_path = LOG_DIR / f"{name}.csv"
+                if not csv_path.exists():
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                entries = []
+                with open(csv_path, "r") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        def pint(v):
+                            return int(v) if v and v != "None" else None
+                        entries.append({
+                            "t": float(row["elapsed_sec"]),
+                            "p1": pint(row["probe1_cur"]),
+                            "p1_set": pint(row["probe1_set"]),
+                            "p2": pint(row["probe2_cur"]),
+                            "p2_set": pint(row["probe2_set"]),
+                            "p3": pint(row["probe3_cur"]),
+                            "p3_set": pint(row["probe3_set"]),
+                        })
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(entries).encode())
+            elif self.path.startswith("/session/"):
+                name = self.path.split("/")[-1]
+                csv_path = LOG_DIR / f"{name}.csv"
+                if not csv_path.exists():
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                meta = load_sessions_meta()
+                label = meta.get(name, {}).get("label", name)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(SESSION_VIEW_HTML.replace("__SESSION_NAME__", name).replace("__SESSION_LABEL__", label).encode())
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1387,6 +2224,16 @@ def monitor_status(ip: str, ble_device_address: str | None = None):
                     print("\nConnection lost.")
                     return False
 
+                # Send any queued commands
+                while not _cmd_queue.empty():
+                    try:
+                        cmd = _cmd_queue.get_nowait()
+                        sock.send(cmd)
+                        if ARGS.debug:
+                            print(f"\n  [CMD TX] {cmd.hex(' ')}")
+                    except (socket.error, OSError, queue.Empty):
+                        pass
+
                 while len(buf) >= STATUS_PACKET_SIZE:
                     if buf[4] in (ALARM_SILENT, ALARM_FIRING) and buf[5] == 0x00:
                         packet = buf[:STATUS_PACKET_SIZE]
@@ -1421,7 +2268,7 @@ def monitor_status(ip: str, ble_device_address: str | None = None):
 
         # Connection lost — alert and try to reconnect
         print("\nConnection lost. Attempting to reconnect...")
-        notify_macos("Gravity BBQ", "Connection to device lost!", critical=True)
+        send_notification(get_profile()["name"], "Connection to device lost!", critical=True)
         reconnected = False
         for attempt in range(15):
             time.sleep(2)
@@ -1483,7 +2330,7 @@ def scan_subnet_for_devices(timeout: float = 2.0) -> list[str]:
         return []
 
     subnet_prefix = ".".join(local_ip.split(".")[:3])
-    print(f"Scanning {subnet_prefix}.0/24 for Gravity devices on port {TCP_PORT}...")
+    print(f"Scanning for Char-Griller devices on port {TCP_PORT}...")
 
     found_ips: list[str] = []
     lock = __import__("threading").Lock()
@@ -1526,18 +2373,19 @@ def scan_subnet_for_devices(timeout: float = 2.0) -> list[str]:
 
 async def main():
     print("=" * 50)
-    print("  Gravity BBQ Controller — Command Line Monitor")
+    print("  chargrillerd — Command Line Monitor")
     print("=" * 50)
     print()
 
     # --disconnect mode: find device via BLE and send WiFi disconnect command
     if ARGS.disconnect:
-        print("Scanning for Gravity device to disconnect...")
-        devices = await scan_for_gravity_devices(timeout=ARGS.scan_timeout)
+        print("Scanning for device to disconnect...")
+        devices = await scan_for_devices(timeout=ARGS.scan_timeout)
         if not devices:
-            print("No Gravity device found via BLE. It may already be disconnected.")
+            print("No device found via BLE. It may already be disconnected.")
             return None, None
         device_addr = devices[0][0]
+        device_adapter = devices[0][3]
         print(f"Found: {devices[0][1]}")
 
         # Check if device is on WiFi first
@@ -1554,7 +2402,7 @@ async def main():
             return None, None
 
         print("Sending WiFi disconnect command...")
-        success = await ble_disconnect_wifi(device_addr)
+        success = await ble_disconnect_wifi(device_addr, adapter=device_adapter)
         if success:
             print("Device disconnected from WiFi successfully.")
         else:
@@ -1578,15 +2426,15 @@ async def main():
 
     # Step 1b: WiFi subnet scan mode (--wifi flag)
     if ARGS.wifi:
-        print("Step 1: Scanning WiFi subnet for Gravity devices (--wifi flag)...")
+        print("Step 1: Scanning WiFi subnet for devices (--wifi flag)...")
         wifi_ips = scan_subnet_for_devices()
 
         if wifi_ips:
             if len(wifi_ips) == 1:
                 wifi_ip = wifi_ips[0]
-                print(f"\nFound Gravity device at {wifi_ip}:{TCP_PORT}")
+                print(f"\nFound device at {wifi_ip}:{TCP_PORT}")
             else:
-                print(f"\nFound {len(wifi_ips)} Gravity device(s) on WiFi:\n")
+                print(f"\nFound {len(wifi_ips)} device(s) on WiFi:\n")
                 for i, ip in enumerate(wifi_ips):
                     print(f"  [{i + 1}] {ip}")
                 while True:
@@ -1603,15 +2451,15 @@ async def main():
             monitor_status(wifi_ip, None)
             return None, None
 
-        print("No Gravity devices found on WiFi.")
+        print("No devices found on WiFi.")
         return None, None
 
     # Step 2: Scan for Gravity devices via BLE
-    print("Step 2: Scanning for Gravity devices via BLE...")
-    devices = await scan_for_gravity_devices(timeout=ARGS.scan_timeout)
+    print("Step 2: Scanning for devices via BLE...")
+    devices = await scan_for_devices(timeout=ARGS.scan_timeout)
 
     if not devices:
-        print("\nNo Gravity devices found via BLE or WiFi.")
+        print("\nNo devices found via BLE or WiFi.")
         print("Make sure the device is powered on and in range.")
         ip = input("\nEnter device IP manually (or Enter to exit): ").strip()
         if not ip:
@@ -1624,8 +2472,8 @@ async def main():
         return None, None
 
     # Step 3: Let user choose device
-    print(f"\nFound {len(devices)} Gravity device(s):\n")
-    for i, (addr, name, rssi) in enumerate(devices):
+    print(f"\nFound {len(devices)} Char-Griller device(s):\n")
+    for i, (addr, name, rssi, _adp) in enumerate(devices):
         print(f"  [{i + 1}] {name}  (RSSI: {rssi} dBm)")
 
     if len(devices) == 1:
@@ -1642,13 +2490,15 @@ async def main():
                 pass
             print("Invalid selection.")
 
-    device_addr, device_name, _ = devices[choice]
+    device_addr, device_name, _, device_adapter = devices[choice]
+    detect_device_from_name(device_name)
+    profile = get_profile()
 
     # Step 4: Connect and provision WiFi
     # Tries stored credentials first. If that fails, scans for networks
     # and provisions credentials interactively.
-    print(f"\nSelected: {device_name}")
-    wifi_info = await ble_full_provision(device_addr)
+    print(f"\nSelected: {device_name} (detected: {profile['name']})")
+    wifi_info = await ble_full_provision(device_addr, adapter=device_adapter)
 
     if wifi_info is None:
         print("\nFailed to connect device to WiFi.")
