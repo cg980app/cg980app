@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>__SESSION_LABEL__ - Session Replay</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }
+  h1 { text-align: center; color: #ff6b35; margin-bottom: 5px; font-size: 24px; }
+  .subtitle { text-align: center; color: #888; margin-bottom: 20px; font-size: 14px; }
+  .chart-container { max-width: 900px; margin: 0 auto; background: #16213e; border-radius: 10px; padding: 20px; border: 1px solid #0f3460; }
+  .chart-controls { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .chart-controls button { background: #0f3460; color: #eee; border: 1px solid #1a4a8a; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+  .chart-controls button:hover { background: #1a4a8a; }
+  .chart-controls button.active { background: #ff6b35; border-color: #ff6b35; }
+  .chart-controls span { color: #888; font-size: 12px; }
+  canvas { width: 100% !important; height: 400px !important; }
+  .stats { max-width: 900px; margin: 20px auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+  .stat-card { background: #16213e; border-radius: 8px; padding: 12px; border: 1px solid #0f3460; text-align: center; }
+  .stat-card h3 { color: #aaa; font-size: 11px; text-transform: uppercase; margin: 0 0 6px; }
+  .stat-val { color: #ff6b35; font-size: 20px; font-weight: bold; }
+  .stat-detail { color: #666; font-size: 11px; margin-top: 4px; }
+</style>
+</head>
+<body>
+<h1>__SESSION_LABEL__</h1>
+<div class="subtitle">Session replay (read-only) &middot; <a href="/" style="color:#2aa198">Back to live</a></div>
+
+<div class="stats" id="stats"></div>
+
+<div class="chart-container">
+  <div class="chart-controls">
+    <button onclick="setZoom('all')" id="z-all" class="active">All</button>
+    <button onclick="setZoom(5)" id="z-5">5m</button>
+    <button onclick="setZoom(15)" id="z-15">15m</button>
+    <button onclick="setZoom(30)" id="z-30">30m</button>
+    <button onclick="setZoom(60)" id="z-60">1h</button>
+    <button onclick="setZoom(120)" id="z-120">2h</button>
+    <span>|</span>
+    <button onclick="panChart(-1)">&larr;</button>
+    <button onclick="panChart(1)">&rarr;</button>
+    <button onclick="panChart(0)">Latest</button>
+    <span id="chart-range"></span>
+  </div>
+  <canvas id="chart"></canvas>
+</div>
+
+<script>
+let history = [];
+let zoomMinutes = 'all';
+let panOffset = 0;
+
+function setZoom(mins) {
+  zoomMinutes = mins;
+  panOffset = 0;
+  document.querySelectorAll('.chart-controls button[id^="z-"]').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('z-' + mins);
+  if (btn) btn.classList.add('active');
+  drawChart();
+}
+
+function panChart(dir) {
+  if (zoomMinutes === 'all') return;
+  const step = zoomMinutes * 60 * 0.25;
+  if (dir === 0) { panOffset = 0; }
+  else { panOffset += dir * step; }
+  if (panOffset < 0) panOffset = 0;
+  drawChart();
+}
+
+function drawChart() {
+  if (!history.length) return;
+  const canvas = document.getElementById('chart');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.clientWidth * dpr;
+  canvas.height = canvas.clientHeight * dpr;
+  ctx.scale(dpr, dpr);
+  const W = canvas.clientWidth;
+  const H = canvas.clientHeight;
+  ctx.clearRect(0, 0, W, H);
+
+  const maxT = history[history.length - 1].t;
+  let tMin = 0, tMax = maxT;
+  if (zoomMinutes !== 'all') {
+    const window_s = zoomMinutes * 60;
+    tMax = maxT - panOffset;
+    tMin = tMax - window_s;
+    if (tMin < 0) { tMin = 0; tMax = Math.min(window_s, maxT); }
+  }
+
+  const rangeEl = document.getElementById('chart-range');
+  function fmt(s) { const m = Math.floor(s/60); return m < 60 ? m+'m'+Math.floor(s%60)+'s' : Math.floor(m/60)+'h'+m%60+'m'; }
+  rangeEl.textContent = fmt(tMin) + ' - ' + fmt(tMax);
+
+  const pad = {top: 30, bottom: 30, left: 40, right: 10};
+  const plotW = W - pad.left - pad.right;
+  const plotH = H - pad.top - pad.bottom;
+
+  const visible = history.filter(e => e.t >= tMin && e.t <= tMax);
+  if (!visible.length) return;
+
+  let yMax = 0;
+  visible.forEach(e => {
+    if (e.p1 !== null && e.p1 > yMax) yMax = e.p1;
+    if (e.p2 !== null && e.p2 > yMax) yMax = e.p2;
+    if (e.p3 !== null && e.p3 > yMax) yMax = e.p3;
+    if (e.p1_set !== null && e.p1_set > yMax) yMax = e.p1_set;
+  });
+  yMax = Math.ceil(yMax * 1.15 / 10) * 10;
+  if (yMax < 50) yMax = 50;
+
+  function x(t) { return pad.left + (t - tMin) / (tMax - tMin) * plotW; }
+  function y(v) { return pad.top + plotH - (v / yMax) * plotH; }
+
+  // Grid
+  ctx.strokeStyle = '#1a3a5c'; ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 5; i++) {
+    const yy = pad.top + plotH * i / 5;
+    ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(W - pad.right, yy); ctx.stroke();
+    ctx.fillStyle = '#666'; ctx.font = '10px sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText(Math.round(yMax * (5 - i) / 5), pad.left - 5, yy + 3);
+  }
+
+  // Target line (dashed)
+  const lastSet = visible[visible.length-1].p1_set;
+  if (lastSet) {
+    ctx.strokeStyle = '#ff6b35'; ctx.lineWidth = 1; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(pad.left, y(lastSet)); ctx.lineTo(W-pad.right, y(lastSet)); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Draw lines
+  const series = [{key:'p1',color:'#ff6b35'},{key:'p2',color:'#3498db'},{key:'p3',color:'#f1c40f'}];
+  series.forEach(s => {
+    ctx.strokeStyle = s.color; ctx.lineWidth = 2; ctx.beginPath();
+    let started = false;
+    visible.forEach(e => {
+      if (e[s.key] !== null) {
+        const px = x(e.t), py = y(e[s.key]);
+        if (!started) { ctx.moveTo(px, py); started = true; } else { ctx.lineTo(px, py); }
+      }
+    });
+    if (started) ctx.stroke();
+  });
+
+  // Legend
+  ctx.font = '11px sans-serif';
+  let lx = pad.left + 5;
+  series.forEach(s => {
+    ctx.fillStyle = s.color;
+    ctx.fillRect(lx, pad.top - 18, 10, 10);
+    ctx.fillText(s.key === 'p1' ? 'Probe 1' : s.key === 'p2' ? 'Probe 2' : 'Probe 3', lx + 14, pad.top - 9);
+    lx += 80;
+  });
+}
+
+fetch('/api/session/data/__SESSION_NAME__').then(r => r.json()).then(data => {
+  history = data;
+  drawChart();
+
+  // Stats
+  const duration = data.length ? data[data.length-1].t : 0;
+  const durationStr = duration > 3600 ? Math.floor(duration/3600)+'h '+Math.floor(duration%3600/60)+'m' : Math.floor(duration/60)+'m';
+  const p1vals = data.filter(e => e.p1 !== null).map(e => e.p1);
+  const p3vals = data.filter(e => e.p3 !== null).map(e => e.p3);
+  let statsHtml = '<div class="stat-card"><h3>Duration</h3><div class="stat-val">'+durationStr+'</div><div class="stat-detail">'+data.length+' readings</div></div>';
+  if (p1vals.length) {
+    statsHtml += '<div class="stat-card"><h3>Chamber</h3><div class="stat-val">'+Math.round(p1vals.reduce((a,b)=>a+b)/p1vals.length)+'&deg;F avg</div><div class="stat-detail">'+Math.min(...p1vals)+'&deg; - '+Math.max(...p1vals)+'&deg;</div></div>';
+  }
+  if (p3vals.length) {
+    statsHtml += '<div class="stat-card"><h3>Probe 3</h3><div class="stat-val">'+Math.round(p3vals.reduce((a,b)=>a+b)/p3vals.length)+'&deg;F avg</div><div class="stat-detail">'+Math.min(...p3vals)+'&deg; - '+Math.max(...p3vals)+'&deg;</div></div>';
+  }
+  document.getElementById('stats').innerHTML = statsHtml;
+});
+
+window.addEventListener('resize', drawChart);
+</script>
+<div style="text-align:center;padding:20px 0 10px;font-size:11px;color:#555">
+  <a href="https://github.com/cg980app/cg980app" target="_blank" rel="noopener" style="color:#666;text-decoration:none">chargrillerd on GitHub</a> &middot; MIT License
+</div>
+</body>
+</html>

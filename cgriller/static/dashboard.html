@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Char-Griller Monitor</title>
+<link rel="stylesheet" href="/static/uPlot.min.css">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }
+  h1 { text-align: center; color: #ff6b35; margin-bottom: 5px; }
+  .subtitle { text-align: center; color: #888; margin-bottom: 20px; font-size: 14px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; max-width: 900px; margin: 0 auto 30px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; max-width: 900px; margin: 0 auto 30px; }
+  .card { background: #16213e; border-radius: 10px; padding: 15px; text-align: center; border: 1px solid #0f3460; }
+  .card.alarm { border-color: #e74c3c; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { border-color: #ff0; } }
+  .card h3 { margin: 0 0 8px; color: #aaa; font-size: 13px; text-transform: uppercase; }
+  .temp { font-size: 36px; font-weight: bold; color: #ff6b35; }
+  .temp.cool { color: #4ecdc4; }
+  .set { font-size: 14px; color: #888; margin-top: 5px; }
+  .trend { font-size: 12px; color: #777; margin-top: 4px; }
+  .badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+  .badge.on { background: #27ae60; color: #fff; }
+  .badge.off { background: #555; color: #aaa; }
+  .badge.alert { background: #e74c3c; color: #fff; }
+  .chart-container { max-width: 900px; margin: 0 auto; background: #16213e; border-radius: 10px; padding: 20px; border: 1px solid #0f3460; }
+  .chart-controls { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .chart-controls button { background: #0f3460; color: #eee; border: 1px solid #1a4a8a; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+  .chart-controls button:hover { background: #1a4a8a; }
+  .chart-controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .chart-controls button:disabled:hover { background: #0f3460; }
+  .chart-controls button.active { background: #ff6b35; border-color: #ff6b35; }
+  .chart-controls span { color: #888; font-size: 12px; }
+  #chart { width: 100%; }
+  /* uPlot dark-theme overrides (its legend is HTML, default text is dark) */
+  .u-legend { color: #ccc; font-size: 12px; }
+  .u-legend th, .u-legend td { color: #ccc; }
+  .u-legend .u-value { color: #fff; }
+  /* Hide the x-series legend row (uPlot's default "Value" cursor readout) —
+     the time is already on the chart's two x-axes. */
+  .u-legend .u-series:first-child { display: none; }
+  .disconnected { text-align: center; color: #666; font-size: 24px; }
+  .conn-lost { display: none; background: #e74c3c; color: #fff; text-align: center; padding: 12px; font-weight: bold; border-radius: 8px; max-width: 900px; margin: 0 auto 15px; animation: pulse 1.5s infinite; }
+  .alarm-row { display: flex; gap: 6px; margin-top: 8px; justify-content: center; align-items: center; }
+  .alarm-input { width: 60px; background: #0f3460; border: 1px solid #1a4a8a; color: #eee; padding: 4px 6px; border-radius: 4px; font-size: 12px; text-align: center; }
+  .alarm-input::placeholder { color: #555; }
+  .alarm-label { font-size: 11px; color: #666; }
+  .alarm-set-btn { background: #0f3460; border: 1px solid #1a4a8a; color: #ff6b35; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; }
+  .alarm-set-btn:hover { background: #1a4a8a; }
+  .settings-bar { display: flex; gap: 8px; align-items: center; justify-content: center; max-width: 900px; margin: 0 auto 15px; font-size: 12px; color: #888; }
+  .settings-label { color: #666; }
+  .fan-control { display: flex; gap: 6px; align-items: center; justify-content: center; margin-top: 8px; }
+  .fan-select { background: #0f3460; border: 1px solid #1a4a8a; color: #eee; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+  .alarm-banner { display: none; background: #e74c3c; color: #fff; text-align: center; padding: 14px; font-weight: bold; font-size: 18px; border-radius: 8px; max-width: 900px; margin: 0 auto 15px; animation: pulse 0.5s infinite; cursor: pointer; }
+</style>
+<script src="/static/uPlot.iife.min.js"></script>
+</head>
+<body>
+<h1 id="deviceTitle">Char-Griller Monitor</h1>
+<div class="subtitle" id="timestamp">Connecting...</div>
+<div class="conn-lost" id="conn-status">CONNECTION LOST — Server is not responding</div>
+<div class="alarm-banner" id="alarm-banner" onclick="dismissAlarm()">ALARM — Click to dismiss</div>
+<div class="settings-bar" id="alarmInfo">
+  <span class="settings-label">Alarm tone:</span>
+  <select class="fan-select" id="toneSelect" onchange="setTone(this.value)">
+    <option value="beep">Beep</option>
+    <option value="siren">Siren</option>
+    <option value="chime">Chime</option>
+    <option value="urgent">Urgent</option>
+  </select>
+  <span class="settings-label">Chamber range:</span>
+  <select class="fan-select" id="rangeSelect" onchange="setChamberRange(this.value)">
+    <option value="10">±10°F</option>
+    <option value="15">±15°F</option>
+    <option value="20">±20°F</option>
+    <option value="25">±25°F</option>
+    <option value="30">±30°F</option>
+    <option value="40">±40°F</option>
+    <option value="50">±50°F</option>
+  </select>
+  <button class="alarm-set-btn" onclick="testTone()">Test</button>
+  <button class="alarm-set-btn" id="muteBtn" onclick="toggleMute()">Mute</button>
+</div>
+<div class="grid" id="cards"></div>
+<div class="grid2" id="controls"></div>
+<div class="chart-container">
+  <div class="chart-controls">
+    <button onclick="setZoom('all')" id="z-all" class="active">All</button>
+    <button onclick="setZoom(5)" id="z-5">5m</button>
+    <button onclick="setZoom(15)" id="z-15">15m</button>
+    <button onclick="setZoom(30)" id="z-30">30m</button>
+    <button onclick="setZoom(60)" id="z-60">1h</button>
+    <button onclick="setZoom(120)" id="z-120">2h</button>
+    <span>|</span>
+    <button id="pan-left" onclick="panChart(-1)" disabled>&larr;</button>
+    <button id="pan-right" onclick="panChart(1)" disabled>&rarr;</button>
+    <button id="pan-latest" onclick="panChart(0)" disabled>Latest</button>
+    <span id="chart-range"></span>
+  </div>
+  <div id="chart"></div>
+</div>
+
+<script>
+let history = [];
+let uplot = null;
+let zoomMinutes = 'all';  // 'all' or number of minutes to show
+let panOffset = 0;        // seconds offset from latest (0 = latest visible)
+const CHART_COLORS = { p1: '#ff6b35', p2: '#4ecdc4', p3: '#ffe66d' };
+
+// --- Chart (uPlot) ---
+
+// Map an elapsed-seconds x value to a wall-clock "h:mma/p" string using the
+// session's start epoch (sent by the server). Empty until the first reading.
+function fmtClock(elapsedSec) {
+  const ep = window._startEpoch;
+  if (!ep) return '';
+  const d = new Date((ep + elapsedSec) * 1000);
+  let h = d.getHours();
+  const m = d.getMinutes();
+  const ap = h >= 12 ? 'p' : 'a';
+  h = h % 12; if (h === 0) h = 12;
+  return h + ':' + (m < 10 ? '0' + m : m) + ap;
+}
+
+// history -> columnar [xs, p1, p2, p3, p1_set, p2_set, p3_set], clamped to maxTemp
+function chartData() {
+  const maxT = window._maxTemp || 500;
+  const clamp = v => (v == null ? null : Math.min(v, maxT));
+  return [
+    history.map(e => e.t),
+    history.map(e => clamp(e.p1)),
+    history.map(e => clamp(e.p2)),
+    history.map(e => clamp(e.p3)),
+    history.map(e => clamp(e.p1_set)),
+    history.map(e => clamp(e.p2_set)),
+    history.map(e => clamp(e.p3_set)),
+  ];
+}
+
+// Draw event annotations (door/alarm/fan/target) as vertical lines, clipped to plot.
+function eventsPlugin() {
+  return { hooks: { draw: u => {
+    const evs = window._events || [];
+    if (!evs.length) return;
+    const ctx = u.ctx;
+    const { left, top, width, height } = u.bbox;
+    const evColors = { door: '#e67e22', alarm: '#e74c3c', fan: '#3498db', target: '#2ecc71' };
+    const dpr = window.devicePixelRatio || 1;
+    ctx.save();
+    ctx.beginPath(); ctx.rect(left, top, width, height); ctx.clip();
+    ctx.font = Math.round(11 * dpr) + 'px sans-serif';
+    for (const ev of evs) {
+      const x = Math.round(u.valToPos(ev.t, 'x', true));
+      if (x < left || x > left + width) continue;
+      ctx.strokeStyle = evColors[ev.cat] || '#888';
+      ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + height); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = evColors[ev.cat] || '#888';
+      ctx.save();
+      ctx.translate(x + 3 * dpr, top + 3 * dpr); ctx.rotate(Math.PI / 2);
+      ctx.textAlign = 'left'; ctx.fillText(ev.label, 0, 0);
+      ctx.restore();
+    }
+    ctx.restore();
+  } } };
+}
+
+function makeChart() {
+  const el = document.getElementById('chart');
+  const mkSeries = (label, color, dash) => ({
+    label, stroke: color, width: dash ? 1.5 : 2,
+    dash: dash || [], points: { show: false },
+    value: (u, v) => (v == null ? '--' : Math.round(v) + '°'),
+  });
+  const opts = {
+    width: el.clientWidth || 860,
+    height: 300,
+    scales: {
+      x: { time: false },
+      y: { range: (u, dmin, dmax) => [Math.max(0, dmin - 20), Math.min(window._maxTemp || 500, dmax + 20)] },
+    },
+    axes: [
+      // Bottom x-axis: elapsed session time in minutes.
+      { scale: 'x', stroke: '#888', grid: { stroke: '#2a2a4a' }, ticks: { stroke: '#2a2a4a' },
+        values: (u, vals) => vals.map(v => Math.floor(v / 60) + 'm') },
+      // Top x-axis: wall-clock time of day (same scale, mapped via start_epoch).
+      { scale: 'x', side: 0, stroke: '#888', grid: { show: false }, ticks: { stroke: '#2a2a4a' },
+        values: (u, vals) => vals.map(v => fmtClock(v)) },
+      { scale: 'y', stroke: '#888', grid: { stroke: '#2a2a4a' }, ticks: { stroke: '#2a2a4a' },
+        values: (u, vals) => vals.map(v => v + '°') },
+    ],
+    series: [
+      {},
+      mkSeries('Probe 1', CHART_COLORS.p1),
+      mkSeries('Probe 2', CHART_COLORS.p2),
+      mkSeries('Probe 3', CHART_COLORS.p3),
+      mkSeries('P1 target', CHART_COLORS.p1, [6, 4]),
+      mkSeries('P2 target', CHART_COLORS.p2, [6, 4]),
+      mkSeries('P3 target', CHART_COLORS.p3, [6, 4]),
+    ],
+    plugins: [eventsPlugin()],
+  };
+  uplot = new uPlot(opts, chartData(), el);
+}
+
+function applyZoom() {
+  if (!uplot || !history.length) return;
+  const totalStart = history[0].t, totalEnd = history[history.length - 1].t;
+  let visStart, visEnd;
+  if (zoomMinutes === 'all') {
+    visStart = totalStart; visEnd = totalEnd;
+  } else {
+    const win = zoomMinutes * 60;
+    visEnd = totalEnd - panOffset;
+    visStart = visEnd - win;
+    if (visStart < totalStart) { visStart = totalStart; visEnd = Math.min(totalEnd, visStart + win); }
+  }
+  uplot.setScale('x', { min: visStart, max: visEnd });
+  const rangeEl = document.getElementById('chart-range');
+  if (rangeEl) {
+    const fmt = s => Math.floor(s / 60) + 'm' + Math.round(s % 60) + 's';
+    rangeEl.textContent = fmt(visStart) + ' – ' + fmt(visEnd);
+  }
+}
+
+function updateChart() {
+  if (history.length < 2) return;
+  if (!uplot) makeChart();
+  else uplot.setData(chartData(), false);  // false: keep current x-scale (preserve zoom)
+  applyZoom();
+}
+
+function setZoom(mins) {
+  zoomMinutes = mins;
+  panOffset = 0;
+  document.querySelectorAll('.chart-controls button[id^="z-"]').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('z-' + mins);
+  if (btn) btn.classList.add('active');
+  updatePanButtons();
+  applyZoom();
+}
+
+// Pan the visible window through history. panOffset = seconds back from the
+// latest reading (0 = following live). dir < 0 = ← (older), dir > 0 = → (newer),
+// dir === 0 = jump to latest. No-op while showing the full range ('all').
+function panChart(dir) {
+  if (zoomMinutes === 'all' || !history.length) return;
+  const win = zoomMinutes * 60;
+  const totalSpan = history[history.length - 1].t - history[0].t;
+  const maxOffset = Math.max(0, totalSpan - win);  // can't pan past the oldest data
+  const step = win * 0.25;                          // 25% of the visible window
+  if (dir === 0) panOffset = 0;
+  else panOffset -= dir * step;                     // ← (dir<0) increases offset = older
+  panOffset = Math.max(0, Math.min(panOffset, maxOffset));
+  applyZoom();
+}
+
+// Pan/Latest only make sense when zoomed in; disable them in the full-range view.
+function updatePanButtons() {
+  const disabled = (zoomMinutes === 'all');
+  ['pan-left', 'pan-right', 'pan-latest'].forEach(id => {
+    const b = document.getElementById(id);
+    if (b) b.disabled = disabled;
+  });
+}
+
+// --- Grill Command API ---
+function sendCommand(target, value) {
+  fetch('/api/command', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({target: target, value: value})
+  });
+}
+
+function silenceGrill() {
+  // Always squelches the browser tone via stopAlarm() — the caller does that.
+  // Only sends the device-side silence command when the profile says so.
+  // (On Gravity, id 0x05 isn't really silence — it flashes "0000" on the
+  // panel, looks more like a stop/break — so we skip the network send there.)
+  if (window._supportsCommands === false) return;
+  if (window._supportsSilence === false) return;
+  sendCommand('silence', 0);
+}
+
+function sendGrillTemp(probe, el) {
+  const val = el.value.trim();
+  if (val === '') return;
+  const num = parseInt(val);
+  if (isNaN(num)) return;
+  const [lo, hi] = probe === 'probe1' ? [200, 700] : [50, 350];
+  if (num < lo || num > hi) return;  // server also rejects; this just avoids the round-trip
+  sendCommand(probe, num);
+}
+
+function setFan(val) {
+  if (val === 'auto') {
+    sendCommand('fan', 4096);  // 0x1000 = auto
+  } else {
+    sendCommand('fan', parseInt(val));
+  }
+}
+
+
+// --- Browser Alarm System ---
+let alarmFiring = false;
+let alarmInterval = null;
+let alarmCtx = null;
+let alarmMuted = localStorage.getItem('cgrillerMuted') === 'true';
+let alarmTone = localStorage.getItem('cgrillerTone') || 'beep';  // chosen in the UI
+let chamberRange = parseInt(localStorage.getItem('cgrillerChamberRange')) || 25;  // °F, chosen in the UI
+let snoozeUntil = 0;  // ms timestamp; while in the future, probe/grill alarms stay quiet
+
+function getCtx() {
+  if (!alarmCtx) alarmCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return alarmCtx;
+}
+
+const TONES = {
+  beep: function() {
+    const ctx = getCtx(); const now = ctx.currentTime;
+    for (let i = 0; i < 3; i++) {
+      const osc = ctx.createOscillator(); const g = ctx.createGain();
+      osc.frequency.value = 880; g.gain.value = 0.3;
+      osc.connect(g); g.connect(ctx.destination);
+      osc.start(now + i * 0.25); osc.stop(now + i * 0.25 + 0.15);
+    }
+  },
+  siren: function() {
+    const ctx = getCtx(); const now = ctx.currentTime;
+    const osc = ctx.createOscillator(); const g = ctx.createGain();
+    osc.type = 'sawtooth'; g.gain.value = 0.2;
+    osc.frequency.setValueAtTime(600, now);
+    osc.frequency.linearRampToValueAtTime(1200, now + 0.3);
+    osc.frequency.linearRampToValueAtTime(600, now + 0.6);
+    osc.connect(g); g.connect(ctx.destination);
+    osc.start(now); osc.stop(now + 0.6);
+  },
+  chime: function() {
+    const ctx = getCtx(); const now = ctx.currentTime;
+    [523, 659, 784, 1047].forEach(function(freq, i) {
+      const osc = ctx.createOscillator(); const g = ctx.createGain();
+      osc.type = 'sine'; osc.frequency.value = freq;
+      g.gain.setValueAtTime(0.25, now + i * 0.2);
+      g.gain.exponentialRampToValueAtTime(0.01, now + i * 0.2 + 0.4);
+      osc.connect(g); g.connect(ctx.destination);
+      osc.start(now + i * 0.2); osc.stop(now + i * 0.2 + 0.4);
+    });
+  },
+  urgent: function() {
+    const ctx = getCtx(); const now = ctx.currentTime;
+    for (let i = 0; i < 5; i++) {
+      const osc = ctx.createOscillator(); const g = ctx.createGain();
+      osc.frequency.value = 1000; g.gain.value = 0.35;
+      osc.connect(g); g.connect(ctx.destination);
+      osc.start(now + i * 0.15); osc.stop(now + i * 0.15 + 0.08);
+    }
+  }
+};
+
+function playAlarmTone() {
+  if (alarmMuted) return;
+  (TONES[alarmTone] || TONES.beep)();
+}
+
+// Preview the configured tone once (ignores mute, so the Test button always
+// makes a sound).
+function testTone() {
+  (TONES[alarmTone] || TONES.beep)();
+}
+
+// Tone and chamber drift-range are chosen in the UI and persist per-browser.
+function setTone(val) {
+  alarmTone = val;
+  localStorage.setItem('cgrillerTone', val);
+  testTone();  // preview the newly selected tone
+}
+
+function setChamberRange(val) {
+  chamberRange = parseInt(val);
+  localStorage.setItem('cgrillerChamberRange', chamberRange);
+}
+
+function startAlarm(msg) {
+  if (alarmFiring) return;
+  alarmFiring = true;
+  document.getElementById('alarm-banner').textContent = msg + ' — Click to snooze 5 min';
+  document.getElementById('alarm-banner').style.display = 'block';
+  playAlarmTone();
+  alarmInterval = setInterval(playAlarmTone, 2000);
+}
+
+// Stop the audible alarm + banner without touching the grill. Used both by the
+// user ack (via dismissAlarm) and the auto-clear when a connection alarm resolves.
+function stopAlarm() {
+  alarmFiring = false;
+  if (alarmInterval) { clearInterval(alarmInterval); alarmInterval = null; }
+  document.getElementById('alarm-banner').style.display = 'none';
+}
+
+// Acknowledge the firing alarm and snooze for 5 minutes: the same condition
+// (or any other probe/grill alarm) stays quiet during the window, so a barrier
+// the temp crosses repeatedly within those 5 minutes won't keep re-alarming.
+function dismissAlarm() {
+  snoozeUntil = Date.now() + 5 * 60 * 1000;
+  stopAlarm();
+  silenceGrill();
+}
+
+// Mute is a browser-local toggle: it silences the tone but the banner still
+// shows. Acknowledging an alarm is clicking the banner (dismissAlarm).
+function toggleMute() {
+  alarmMuted = !alarmMuted;
+  localStorage.setItem('cgrillerMuted', alarmMuted);
+  document.getElementById('muteBtn').textContent = alarmMuted ? 'Unmute' : 'Mute';
+}
+
+// Track which probes have fired — won't re-fire until temp drops below target
+let alarmFiredProbes = new Set();
+
+function checkAlarms(data) {
+  if (alarmFiring) return;
+  // Honor an active snooze (from acknowledging an alarm). When it expires,
+  // re-arm every probe so a still-out-of-range condition alarms again.
+  if (snoozeUntil) {
+    if (Date.now() < snoozeUntil) return;
+    snoozeUntil = 0;
+    alarmFiredProbes.clear();
+  }
+
+  // The grill's own alarm is sounding (device-reported). Mirror it in the browser.
+  if (data.alarm) {
+    if (!alarmFiredProbes.has('device')) {
+      alarmFiredProbes.add('device');
+      startAlarm('Grill alarm is firing');
+      return;
+    }
+  } else {
+    alarmFiredProbes.delete('device');
+  }
+
+  // Chamber (probe 1): alarm if it drifts too far over/under the set target,
+  // by the chamber range chosen in the UI.
+  const c = data.probe1;
+  if (c.connected && c.set !== null) {
+    const range = chamberRange;
+    if (c.current >= c.set + range) {
+      if (!alarmFiredProbes.has('probe1_over')) {
+        alarmFiredProbes.add('probe1_over');
+        startAlarm('Chamber is ' + (c.current - c.set) + '° over target (' + c.current + '/' + c.set + ')');
+        return;
+      }
+    } else { alarmFiredProbes.delete('probe1_over'); }
+    if (c.current <= c.set - range) {
+      if (!alarmFiredProbes.has('probe1_under')) {
+        alarmFiredProbes.add('probe1_under');
+        startAlarm('Chamber is ' + (c.set - c.current) + '° under target (' + c.current + '/' + c.set + ')');
+        return;
+      }
+    } else { alarmFiredProbes.delete('probe1_under'); }
+  }
+
+  // Food probes (2 & 3): alarm when the target temp is reached.
+  for (const p of [
+    {key: 'probe2', name: 'Probe 2', d: data.probe2},
+    {key: 'probe3', name: 'Probe 3', d: data.probe3}
+  ]) {
+    if (!p.d.connected || p.d.set === null) continue;
+    if (p.d.current >= p.d.set) {
+      if (!alarmFiredProbes.has(p.key)) {
+        alarmFiredProbes.add(p.key);
+        startAlarm(p.name + ' reached target (' + p.d.current + '/' + p.d.set + ')');
+        return;
+      }
+    } else {
+      alarmFiredProbes.delete(p.key);
+    }
+  }
+}
+
+function updateUI(data) {
+  document.getElementById('timestamp').textContent = 'Last update: ' + data.timestamp + ' | Session: ' + data.session_minutes + ' min';
+
+  // Whether the device accepts control commands. The Gravity 980 ignores the
+  // TCP control commands, so its controls are simply not rendered.
+  const dev = data.device || {};
+  window._supportsCommands = dev.supports_commands !== false;
+  window._supportsSilence = dev.supports_silence !== false;
+
+  let html = '';
+
+  const probes = [
+    {name:'Probe 1 (Chamber)', key:'probe1', curKey:'p1', d:data.probe1},
+    {name:'Probe 2 (Food)', key:'probe2', curKey:'p2', d:data.probe2},
+    {name:'Probe 3 (Food)', key:'probe3', curKey:'p3', d:data.probe3}
+  ];
+  for (const p of probes) {
+    if (p.d.connected) {
+      const setHtml = p.d.set !== null ? '<div class="set">Target: '+p.d.set+'°F</div>' : '';
+
+      // Set-temp input (sent to the grill). Same control for all probes.
+      // Only rendered when the device accepts commands; otherwise the target
+      // is shown read-only via setHtml above.
+      let inputHtml = '';
+      if (window._supportsCommands) {
+        const [lo, hi] = p.key === 'probe1' ? [200, 700] : [50, 350];
+        inputHtml = '<div class="alarm-row">'
+          + '<span class="alarm-label">Set temp:</span>'
+          + '<input class="alarm-input" id="alarm-'+p.key+'" type="number" min="'+lo+'" max="'+hi+'" placeholder="°F" value="'+(p.d.set||'')+'" '
+          + 'onfocus="this.select()" '
+          + 'onblur="sendGrillTemp(\''+p.key+'\', this)" '
+          + 'onkeydown="if(event.key===\'Enter\')this.blur()">'
+          + '</div>';
+      }
+
+      // Probe 1 (chamber) only: color the temp by whether it's under (cool) or
+      // at/over (hot) target. Food probes keep the default color.
+      let tempCls = 'temp';
+      if (p.key === 'probe1' && p.d.set !== null) {
+        tempCls = p.d.current < p.d.set ? 'temp cool' : 'temp';
+      }
+
+      html += '<div class="card"><h3>'+p.name+'</h3><div class="'+tempCls+'">'+p.d.current+'°F</div>'+setHtml+inputHtml+'</div>';
+    } else {
+      html += '<div class="card"><h3>'+p.name+'</h3><div class="disconnected">—</div><div class="set">Not connected</div></div>';
+    }
+  }
+
+  let ctrlHtml = '';
+  if (dev.show_fan !== false) {
+    let fanLabel;
+    if (data.fan_auto) { fanLabel = 'Auto'; }
+    else if (data.fan_speed > 0) { fanLabel = data.fan_speed + '%'; }
+    else if (data.turbo) { fanLabel = 'Turbo'; }
+    else { fanLabel = data.fan ? 'On' : 'Off'; }
+    let fanClass = (data.fan_auto || data.fan_speed > 0 || data.turbo || data.fan) ? 'on' : 'off';
+    let fanVal = data.fan_auto ? 'auto' : String(data.fan_speed);
+    ctrlHtml += '<div class="card"><h3>Fan</h3><span class="badge '+fanClass+'">'+fanLabel+'</span>';
+    // Fan speed control only when the device honors fan commands. Gravity
+    // reports fan state but ignores the fan-speed command, so we render it
+    // read-only there.
+    if (window._supportsCommands && dev.supports_fan_control !== false) {
+      ctrlHtml += '<div class="fan-control"><select class="fan-select" onchange="setFan(this.value)">'
+        + '<option value="auto"'+(fanVal==='auto'?' selected':'')+'>Auto</option>'
+        + '<option value="0"'+(fanVal==='0'?' selected':'')+'>Off</option>'
+        + '<option value="5"'+(fanVal==='5'?' selected':'')+'>5%</option>'
+        + '<option value="20"'+(fanVal==='20'?' selected':'')+'>20%</option>'
+        + '<option value="40"'+(fanVal==='40'?' selected':'')+'>40%</option>'
+        + '<option value="60"'+(fanVal==='60'?' selected':'')+'>60%</option>'
+        + '<option value="80"'+(fanVal==='80'?' selected':'')+'>80%</option>'
+        + '<option value="100"'+(fanVal==='100'?' selected':'')+'>100%</option>'
+        + '</select></div>';
+    }
+    ctrlHtml += '</div>';
+  }
+  if (dev.show_door !== false) {
+    ctrlHtml += '<div class="card"><h3>Door</h3><span class="badge '+(data.door?'alert':'off')+'">'+(data.door?'OPEN':'Closed')+'</span></div>';
+  }
+
+  if (dev.web_title) {
+    document.getElementById('deviceTitle').textContent = dev.web_title;
+    document.title = dev.web_title;
+  }
+
+  // Alarm
+  if (data.alarm) {
+    html += '<div class="card alarm"><h3>Alarm</h3><span class="badge alert">FIRING</span></div>';
+  }
+
+  // Don't rebuild while user is interacting with inputs or dropdowns
+  const focused = document.activeElement;
+  const isEditing = focused && (focused.classList.contains('alarm-input') || focused.classList.contains('fan-select'));
+  if (!isEditing) {
+    document.getElementById('cards').innerHTML = html;
+    document.getElementById('controls').innerHTML = ctrlHtml;
+  }
+
+  // Check browser alarms
+  checkAlarms(data);
+}
+
+// --- Connection watchdog ---
+// Alarm if no reading arrives for a while — covers both a dead server/browser
+// link AND the device silently dropping off WiFi (the server keeps the SSE
+// stream open with keepalive *comments*, which don't fire onmessage, so a
+// stalled onmessage reliably means data has stopped flowing).
+let lastMessageTime = Date.now();
+let connAlarmFiring = false;
+const CONN_STALE_MS = 15000;
+
+function checkConnection() {
+  const staleMs = Date.now() - lastMessageTime;
+  const stale = staleMs > CONN_STALE_MS;
+  document.getElementById('conn-status').style.display = stale ? 'block' : 'none';
+  if (stale) {
+    // Don't stack on top of a probe alarm that's already sounding.
+    if (!connAlarmFiring && !alarmFiring) {
+      connAlarmFiring = true;
+      startAlarm('Connection lost — no data for ' + Math.round(staleMs / 1000) + 's');
+    }
+  } else if (connAlarmFiring) {
+    connAlarmFiring = false;
+    stopAlarm();
+  }
+}
+
+function startStream() {
+  // Server-Sent Events: one long-lived connection the server pushes to on each
+  // new reading. The first message carries full history; subsequent messages
+  // carry only the new entries/events since the last tick.
+  // EventSource reconnects automatically; on reconnect we reset local state
+  // because the server replays the full history on the next message.
+  const es = new EventSource('/api/stream');
+  es.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    lastMessageTime = Date.now();
+    if (data.hist_new && data.hist_new.length) {
+      for (const entry of data.hist_new) history.push(entry);
+    }
+    if (data.events_new && data.events_new.length) {
+      if (!window._events) window._events = [];
+      for (const ev of data.events_new) window._events.push(ev);
+    }
+    window._maxTemp = data.cur.max_temp || 500;
+    window._startEpoch = data.cur.start_epoch;
+    updateUI(data.cur);
+    updateChart();
+    document.getElementById('conn-status').style.display = 'none';
+    if (connAlarmFiring) { connAlarmFiring = false; stopAlarm(); }
+  };
+  es.onerror = () => {
+    // Connection dropped; EventSource is already retrying. Show the banner
+    // immediately; the watchdog escalates to an audible alarm if it persists.
+    // Reset local history/events so the server's full replay on reconnect
+    // doesn't end up duplicated against what we already had.
+    document.getElementById('conn-status').style.display = 'block';
+    history = [];
+    window._events = [];
+  };
+}
+
+startStream();
+setInterval(checkConnection, 3000);
+window.addEventListener('resize', () => {
+  if (uplot) uplot.setSize({ width: document.getElementById('chart').clientWidth, height: 300 });
+});
+document.getElementById('muteBtn').textContent = alarmMuted ? 'Unmute' : 'Mute';
+document.getElementById('toneSelect').value = alarmTone;
+document.getElementById('rangeSelect').value = String(chamberRange);
+</script>
+<div style="text-align:center;padding:20px 0 10px;font-size:11px;color:#555">
+  <a href="https://github.com/cg980app/cg980app" target="_blank" rel="noopener" style="color:#666;text-decoration:none">chargrillerd on GitHub</a> &middot; MIT License
+</div>
+</body>
+</html>
